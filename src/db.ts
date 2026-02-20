@@ -89,7 +89,8 @@ export async function insertClassifications(
 
   await pool.query(
     `INSERT INTO classifications (email_id, run_id, subject, sender, received_at, tier, reason, has_list_unsubscribe)
-     VALUES ${values.join(", ")}`,
+     VALUES ${values.join(", ")}
+     ON CONFLICT (email_id, run_id) DO NOTHING`,
     params
   );
 }
