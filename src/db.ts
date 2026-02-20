@@ -113,41 +113,6 @@ export async function completeRun(runId: number, totalProcessed: number) {
   );
 }
 
-/** Get all unacted classifications from completed runs. */
-export async function getUnactedClassifications(): Promise<
-  { runId: number; classification: Classification }[]
-> {
-  const result = await pool.query<{
-    run_id: number;
-    email_id: string;
-    subject: string;
-    sender: string;
-    received_at: string;
-    tier: Tier;
-    reason: string;
-    has_list_unsubscribe: boolean;
-  }>(
-    `SELECT c.run_id, c.email_id, c.subject, c.sender, c.received_at, c.tier, c.reason, c.has_list_unsubscribe
-     FROM classifications c
-     JOIN triage_runs r ON r.run_id = c.run_id
-     WHERE r.completed_at IS NOT NULL AND c.acted_at IS NULL AND c.tier != 'attention'
-     ORDER BY c.run_id, c.received_at`
-  );
-
-  return result.rows.map((r) => ({
-    runId: r.run_id,
-    classification: {
-      emailId: r.email_id,
-      subject: r.subject,
-      from: r.sender,
-      receivedAt: r.received_at,
-      tier: r.tier,
-      reason: r.reason,
-      hasListUnsubscribe: r.has_list_unsubscribe,
-    },
-  }));
-}
-
 /** Get summary stats for a run. */
 export async function getRunSummary(runId: number) {
   const counts = await pool.query<{ tier: Tier; count: string }>(

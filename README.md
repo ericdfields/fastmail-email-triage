@@ -75,32 +75,15 @@ This will:
 
 If classification fails for a batch, those emails get a fallback `confirm` tier with no action applied.
 
-### Replay
-
-Apply actions to previously classified emails that were never acted on (e.g., from runs before action mode existed):
-
-```
-npm run replay
-```
-
-### Import
-
-Import classifications from a JSONL file:
-
-```
-doppler run -- tsx src/import-jsonl.ts <path-to-jsonl>
-```
-
 ## Project structure
 
 ```
 src/
-  index.ts       — Entry point, orchestrates triage/replay flow
-  jmap.ts        — Fastmail JMAP client (session, mailbox queries, email fetching, actions)
-  classifier.ts  — Claude-based email classification
-  db.ts          — PostgreSQL persistence (runs, classifications, action tracking)
-  types.ts       — Shared TypeScript interfaces
-  import-jsonl.ts — One-off JSONL import utility
+  index.ts      — Entry point, orchestrates triage flow
+  jmap.ts       — Fastmail JMAP client (session, mailbox queries, email fetching, actions)
+  classifier.ts — Claude-based email classification
+  db.ts         — PostgreSQL persistence (runs, classifications, action tracking)
+  types.ts      — Shared TypeScript interfaces
 ```
 
 ## Resumability

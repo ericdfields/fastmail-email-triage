@@ -9,62 +9,8 @@ import {
   markActionsApplied,
   completeRun,
   getRunSummary,
-  getUnactedClassifications,
 } from "./db.js";
 import type { Classification, MailboxIds } from "./types.js";
-
-async function replay() {
-  if (!process.env.FASTMAIL_API_TOKEN)
-    throw new Error("Missing FASTMAIL_API_TOKEN");
-
-  initDb();
-
-  const rows = await getUnactedClassifications();
-  if (rows.length === 0) {
-    console.log("No unacted classifications to replay.");
-    await closeDb();
-    return;
-  }
-
-  // Group by run
-  const byRun = new Map<number, Classification[]>();
-  for (const { runId, classification } of rows) {
-    let list = byRun.get(runId);
-    if (!list) {
-      list = [];
-      byRun.set(runId, list);
-    }
-    list.push(classification);
-  }
-
-  console.log(`Replaying actions for ${rows.length} emails across ${byRun.size} run(s)`);
-
-  const session = await getSession();
-  const mailboxIds = await getMailboxIds(session);
-
-  let totalSucceeded = 0;
-  let totalFailed = 0;
-
-  for (const [runId, classifications] of byRun) {
-    console.log(`\nRun #${runId}: ${classifications.length} emails`);
-    try {
-      const results = await applyActions(session, mailboxIds, classifications);
-      const succeeded = results.filter((r) => r.success).map((r) => r.emailId);
-      const failed = results.filter((r) => !r.success);
-      if (succeeded.length > 0) await markActionsApplied(runId, succeeded);
-      totalSucceeded += succeeded.length;
-      totalFailed += failed.length;
-      console.log(`  ${succeeded.length} applied, ${failed.length} failed`);
-      for (const f of failed) console.error(`  Action failed: ${f.emailId} — ${f.error}`);
-    } catch (err) {
-      console.error(`  Batch failed:`, err);
-      totalFailed += classifications.length;
-    }
-  }
-
-  console.log(`\nReplay complete: ${totalSucceeded} succeeded, ${totalFailed} failed`);
-  await closeDb();
-}
 
 async function main() {
   if (!process.env.FASTMAIL_API_TOKEN)
@@ -204,9 +150,7 @@ async function main() {
   await closeDb();
 }
 
-const entry = process.argv.includes("--replay") ? replay : main;
-
-entry().catch(async (err) => {
+main().catch(async (err) => {
   console.error("Fatal error:", err);
   try {
     await closeDb();
