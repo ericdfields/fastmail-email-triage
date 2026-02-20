@@ -21,32 +21,44 @@ export async function getSession(): Promise<JMAPSession> {
   };
 }
 
+const MAX_RETRIES = 3;
+
 async function jmapRequest(session: JMAPSession, body: object): Promise<any> {
-  const response = await fetch(session.apiUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.FASTMAIL_API_TOKEN}`,
-    },
-    body: JSON.stringify(body),
-  });
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const response = await fetch(session.apiUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${process.env.FASTMAIL_API_TOKEN}`,
+        },
+        body: JSON.stringify(body),
+      });
 
-  if (!response.ok) {
-    throw new Error(`JMAP error: ${response.status} ${response.statusText}`);
-  }
+      if (!response.ok) {
+        throw new Error(`JMAP error: ${response.status} ${response.statusText}`);
+      }
 
-  const data = await response.json();
+      const data = await response.json();
 
-  // Check for method-level errors
-  for (const [name, result, id] of data.methodResponses) {
-    if (name === "error") {
-      throw new Error(
-        `JMAP method error (${id}): ${(result as any).type} - ${(result as any).description}`
-      );
+      // Check for method-level errors
+      for (const [name, result, id] of data.methodResponses) {
+        if (name === "error") {
+          throw new Error(
+            `JMAP method error (${id}): ${(result as any).type} - ${(result as any).description}`
+          );
+        }
+      }
+
+      return data;
+    } catch (err) {
+      const isNetworkError = err instanceof TypeError && (err as any).cause?.code === "ETIMEDOUT";
+      if (!isNetworkError || attempt === MAX_RETRIES) throw err;
+      const delay = attempt * 2000;
+      console.warn(`  JMAP request timed out, retrying in ${delay / 1000}s (attempt ${attempt}/${MAX_RETRIES})...`);
+      await new Promise((r) => setTimeout(r, delay));
     }
   }
-
-  return data;
 }
 
 export async function getMailboxIds(session: JMAPSession): Promise<MailboxIds> {
