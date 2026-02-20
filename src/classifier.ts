@@ -39,7 +39,8 @@ Return a JSON array. Each element:
 Return ONLY the JSON array, no markdown fences, no explanation outside the array.`;
 
 export async function classifyBatch(
-  emails: EmailSummary[]
+  emails: EmailSummary[],
+  model: string = "claude-sonnet-4-6"
 ): Promise<Classification[]> {
   const userMessage = emails.map((e) => ({
     emailId: e.id,
@@ -53,7 +54,7 @@ export async function classifyBatch(
   }));
 
   const response = await anthropic.messages.create({
-    model: "claude-sonnet-4-6",
+    model,
     max_tokens: 4096,
     system: SYSTEM_PROMPT,
     messages: [

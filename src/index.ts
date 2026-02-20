@@ -18,6 +18,11 @@ async function main() {
   if (!process.env.ANTHROPIC_API_KEY)
     throw new Error("Missing ANTHROPIC_API_KEY");
 
+  const model = process.argv.includes("--haiku")
+    ? "claude-haiku-4-5-20251001"
+    : "claude-sonnet-4-6";
+  console.log(`Model: ${model}`);
+
   initDb();
 
   // Check for an incomplete run to resume
@@ -91,7 +96,7 @@ async function main() {
     let isFallback = false;
 
     try {
-      classifications = await classifyBatch(newEmails);
+      classifications = await classifyBatch(newEmails, model);
     } catch (err) {
       console.error(`  Classification failed:`, err);
       classifications = newEmails.map((email) => ({

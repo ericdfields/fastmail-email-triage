@@ -156,7 +156,7 @@ export async function* fetchAllUnread(
       threadId: email.threadId,
       subject: email.subject || "(no subject)",
       from: email.from || [],
-      receivedAt: email.receivedAt,
+      receivedAt: email.receivedAt || new Date().toISOString(),
       preview: email.preview || "",
       hasListUnsubscribe:
         email["header:List-Unsubscribe:asURLs"] !== null,
