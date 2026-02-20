@@ -21,7 +21,9 @@ async function main() {
   const model = process.argv.includes("--haiku")
     ? "claude-haiku-4-5-20251001"
     : "claude-sonnet-4-6";
-  console.log(`Model: ${model}`);
+  const watchMode = process.argv.includes("--watch");
+  const POLL_INTERVAL = 60_000;
+  console.log(`Model: ${model}${watchMode ? " (watch mode)" : ""}`);
 
   initDb();
 
@@ -74,71 +76,98 @@ async function main() {
   }
 
   let batchNum = 0;
+  let stopping = false;
 
-  for await (const batch of fetchAllUnread(session, mailboxIds.inbox)) {
-    const newEmails = batch.filter((e) => !alreadyClassified.has(e.id));
+  if (watchMode) {
+    process.on("SIGINT", () => {
+      if (stopping) process.exit(1);
+      stopping = true;
+      console.log("\nStopping after current batch...");
+    });
+  }
 
-    batchNum++;
-    if (newEmails.length === 0) {
-      console.log(
-        `\nBatch ${batchNum}: ${batch.length} emails (all already classified, skipping)`
-      );
-      continue;
-    }
+  while (true) {
+    let batchesThisPoll = 0;
 
-    const skipped = batch.length - newEmails.length;
-    console.log(
-      `\nBatch ${batchNum}: ${newEmails.length} emails` +
-        (skipped > 0 ? ` (${skipped} already classified, skipped)` : "")
-    );
+    for await (const batch of fetchAllUnread(session, mailboxIds.inbox)) {
+      if (stopping) break;
 
-    let classifications: Classification[];
-    let isFallback = false;
+      const newEmails = batch.filter((e) => !alreadyClassified.has(e.id));
 
-    try {
-      classifications = await classifyBatch(newEmails, model);
-    } catch (err) {
-      console.error(`  Classification failed:`, err);
-      classifications = newEmails.map((email) => ({
-        emailId: email.id,
-        subject: email.subject,
-        from: email.from.map((f) => f.email).join(", "),
-        receivedAt: email.receivedAt,
-        tier: "confirm",
-        reason: "Classification failed — defaulting to confirm",
-        hasListUnsubscribe: email.hasListUnsubscribe,
-      }));
-      isFallback = true;
-    }
-
-    await insertClassifications(runId, classifications);
-    totalClassified += classifications.length;
-
-    const tierCounts = classifications.reduce(
-      (acc, c) => {
-        acc[c.tier] = (acc[c.tier] || 0) + 1;
-        return acc;
-      },
-      {} as Record<string, number>
-    );
-    console.log(`  Classified: ${JSON.stringify(tierCounts)}`);
-
-    // Apply actions (skip for fallback classifications — leave for manual review)
-    if (!isFallback) {
-      try {
-        const results = await applyActions(session, mailboxIds, classifications);
-        const succeeded = results.filter((r) => r.success).map((r) => r.emailId);
-        const failed = results.filter((r) => !r.success);
-        if (succeeded.length > 0) await markActionsApplied(runId, succeeded);
-        console.log(`  Actions: ${succeeded.length} applied, ${failed.length} failed`);
-        for (const f of failed) console.error(`  Action failed: ${f.emailId} — ${f.error}`);
-      } catch (err) {
-        console.error("  Action batch failed:", err);
+      batchNum++;
+      if (newEmails.length === 0) {
+        console.log(
+          `\nBatch ${batchNum}: ${batch.length} emails (all already classified, skipping)`
+        );
+        continue;
       }
+
+      batchesThisPoll++;
+      const skipped = batch.length - newEmails.length;
+      console.log(
+        `\nBatch ${batchNum}: ${newEmails.length} emails` +
+          (skipped > 0 ? ` (${skipped} already classified, skipped)` : "")
+      );
+
+      let classifications: Classification[];
+      let isFallback = false;
+
+      try {
+        classifications = await classifyBatch(newEmails, model);
+      } catch (err) {
+        console.error(`  Classification failed:`, err);
+        classifications = newEmails.map((email) => ({
+          emailId: email.id,
+          subject: email.subject,
+          from: email.from.map((f) => f.email).join(", "),
+          receivedAt: email.receivedAt,
+          tier: "confirm",
+          reason: "Classification failed — defaulting to confirm",
+          hasListUnsubscribe: email.hasListUnsubscribe,
+        }));
+        isFallback = true;
+      }
+
+      await insertClassifications(runId, classifications);
+      totalClassified += classifications.length;
+      for (const c of classifications) alreadyClassified.add(c.emailId);
+
+      const tierCounts = classifications.reduce(
+        (acc, c) => {
+          acc[c.tier] = (acc[c.tier] || 0) + 1;
+          return acc;
+        },
+        {} as Record<string, number>
+      );
+      console.log(`  Classified: ${JSON.stringify(tierCounts)}`);
+
+      // Apply actions (skip for fallback classifications — leave for manual review)
+      if (!isFallback) {
+        try {
+          const results = await applyActions(session, mailboxIds, classifications);
+          const succeeded = results.filter((r) => r.success).map((r) => r.emailId);
+          const failed = results.filter((r) => !r.success);
+          if (succeeded.length > 0) await markActionsApplied(runId, succeeded);
+          console.log(`  Actions: ${succeeded.length} applied, ${failed.length} failed`);
+          for (const f of failed) console.error(`  Action failed: ${f.emailId} — ${f.error}`);
+        } catch (err) {
+          console.error("  Action batch failed:", err);
+        }
+      }
+
+      // Rate limiting pause
+      await new Promise((r) => setTimeout(r, 500));
     }
 
-    // Rate limiting pause
-    await new Promise((r) => setTimeout(r, 500));
+    if (!watchMode || stopping) break;
+
+    if (batchesThisPoll === 0) {
+      console.log(`\nNo new emails. Polling again in ${POLL_INTERVAL / 1000}s...`);
+    } else {
+      console.log(`\nDone with current batch. Polling again in ${POLL_INTERVAL / 1000}s...`);
+    }
+
+    await new Promise((r) => setTimeout(r, POLL_INTERVAL));
   }
 
   await completeRun(runId, totalClassified);
