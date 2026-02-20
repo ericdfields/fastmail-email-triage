@@ -82,7 +82,7 @@ export async function classifyBatch(
       emailId: r.emailId,
       subject: original?.subject ?? "(unknown)",
       from: original?.from.map((f) => f.email).join(", ") ?? "(unknown)",
-      receivedAt: original?.receivedAt ?? "",
+      receivedAt: original?.receivedAt ?? new Date().toISOString(),
       tier: r.tier,
       reason: r.reason,
       hasListUnsubscribe: original?.hasListUnsubscribe ?? false,
