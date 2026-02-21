@@ -147,3 +147,132 @@ export async function getRunSummary(runId: number) {
     })),
   };
 }
+
+// --- Corrections / Accuracy Tracking ---
+
+/** Create the corrections table if it doesn't exist. */
+export async function ensureCorrectionsTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS corrections (
+      correction_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+      email_id TEXT NOT NULL,
+      run_id BIGINT NOT NULL,
+      original_tier tier NOT NULL,
+      corrected_tier tier NOT NULL,
+      corrected_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      FOREIGN KEY (email_id, run_id) REFERENCES classifications(email_id, run_id),
+      UNIQUE (email_id, run_id)
+    )
+  `);
+}
+
+/** Get recent classifications for review. */
+export async function getRecentClassifications(limit: number = 20) {
+  const result = await pool.query<{
+    email_id: string;
+    run_id: number;
+    subject: string;
+    sender: string;
+    received_at: string;
+    tier: Tier;
+    reason: string;
+    has_list_unsubscribe: boolean;
+    corrected_tier: Tier | null;
+  }>(
+    `SELECT c.email_id, c.run_id, c.subject, c.sender, c.received_at,
+            c.tier, c.reason, c.has_list_unsubscribe, cr.corrected_tier
+     FROM classifications c
+     LEFT JOIN corrections cr ON c.email_id = cr.email_id AND c.run_id = cr.run_id
+     ORDER BY c.classified_at DESC
+     LIMIT $1`,
+    [limit]
+  );
+
+  return result.rows.map((r) => ({
+    emailId: r.email_id,
+    runId: r.run_id,
+    subject: r.subject,
+    from: r.sender,
+    receivedAt: r.received_at,
+    tier: r.tier,
+    reason: r.reason,
+    hasListUnsubscribe: r.has_list_unsubscribe,
+    correctedTier: r.corrected_tier,
+  }));
+}
+
+/** Record a correction for an email's classification. */
+export async function insertCorrection(
+  emailId: string,
+  correctedTier: Tier
+): Promise<{ originalTier: Tier; runId: number; subject: string; from: string } | null> {
+  const classResult = await pool.query<{
+    run_id: number;
+    tier: Tier;
+    subject: string;
+    sender: string;
+  }>(
+    `SELECT run_id, tier, subject, sender FROM classifications
+     WHERE email_id = $1
+     ORDER BY classified_at DESC LIMIT 1`,
+    [emailId]
+  );
+
+  if (classResult.rows.length === 0) return null;
+
+  const row = classResult.rows[0]!;
+
+  await pool.query(
+    `INSERT INTO corrections (email_id, run_id, original_tier, corrected_tier)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (email_id, run_id) DO UPDATE SET corrected_tier = $4, corrected_at = now()`,
+    [emailId, row.run_id, row.tier, correctedTier]
+  );
+
+  return { originalTier: row.tier, runId: row.run_id, subject: row.subject, from: row.sender };
+}
+
+/** Get accuracy statistics from corrections. */
+export async function getAccuracyStats() {
+  const totalResult = await pool.query<{ count: string }>(
+    "SELECT COUNT(*)::text as count FROM classifications"
+  );
+  const total = parseInt(totalResult.rows[0]!.count);
+
+  const correctedResult = await pool.query<{ count: string }>(
+    "SELECT COUNT(*)::text as count FROM corrections"
+  );
+  const corrected = parseInt(correctedResult.rows[0]!.count);
+
+  const perTierResult = await pool.query<{ tier: Tier; total: string; corrected: string }>(
+    `SELECT c.tier,
+            COUNT(*)::text as total,
+            COUNT(cr.correction_id)::text as corrected
+     FROM classifications c
+     LEFT JOIN corrections cr ON c.email_id = cr.email_id AND c.run_id = cr.run_id
+     GROUP BY c.tier
+     ORDER BY c.tier`
+  );
+
+  const patternsResult = await pool.query<{ original_tier: Tier; corrected_tier: Tier; count: string }>(
+    `SELECT original_tier, corrected_tier, COUNT(*)::text as count
+     FROM corrections
+     GROUP BY original_tier, corrected_tier
+     ORDER BY COUNT(*) DESC`
+  );
+
+  return {
+    total,
+    corrected,
+    perTier: perTierResult.rows.map((r) => ({
+      tier: r.tier,
+      total: parseInt(r.total),
+      corrected: parseInt(r.corrected),
+    })),
+    patterns: patternsResult.rows.map((r) => ({
+      originalTier: r.original_tier,
+      correctedTier: r.corrected_tier,
+      count: parseInt(r.count),
+    })),
+  };
+}
