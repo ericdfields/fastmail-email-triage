@@ -193,7 +193,7 @@ export async function getRecentClassifications(limit: number = 20) {
     runId: r.run_id,
     subject: r.subject,
     from: r.sender,
-    receivedAt: r.received_at,
+    receivedAt: typeof r.received_at === "string" ? r.received_at : new Date(r.received_at).toISOString(),
     tier: r.tier,
     reason: r.reason,
     hasListUnsubscribe: r.has_list_unsubscribe,
