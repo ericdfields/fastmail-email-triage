@@ -22,8 +22,9 @@ async function main() {
     ? "claude-haiku-4-5-20251001"
     : "claude-sonnet-4-6";
   const watchMode = process.argv.includes("--watch");
+  const dryRun = process.argv.includes("--dry-run");
   const POLL_INTERVAL = 60_000;
-  console.log(`Model: ${model}${watchMode ? " (watch mode)" : ""}`);
+  console.log(`Model: ${model}${watchMode ? " (watch mode)" : ""}${dryRun ? " (dry run)" : ""}`);
 
   initDb();
 
@@ -56,7 +57,7 @@ async function main() {
   console.log(`Mailboxes: inbox=${mailboxIds.inbox}, archive=${mailboxIds.archive}, trash=${mailboxIds.trash}`);
 
   // On resume: retry actions for classified-but-unacted emails
-  if (partial) {
+  if (partial && !dryRun) {
     const pendingActions = partial.classifications.filter(
       (c) => !alreadyActed.has(c.emailId) && c.tier !== "attention"
     );
@@ -141,8 +142,8 @@ async function main() {
       );
       console.log(`  Classified: ${JSON.stringify(tierCounts)}`);
 
-      // Apply actions (skip for fallback classifications — leave for manual review)
-      if (!isFallback) {
+      // Apply actions (skip for fallback classifications and dry runs)
+      if (!isFallback && !dryRun) {
         try {
           const results = await applyActions(session, mailboxIds, classifications);
           const succeeded = results.filter((r) => r.success).map((r) => r.emailId);
@@ -153,6 +154,8 @@ async function main() {
         } catch (err) {
           console.error("  Action batch failed:", err);
         }
+      } else if (dryRun) {
+        console.log("  Actions skipped (dry run)");
       }
 
       // Rate limiting pause

@@ -11,8 +11,10 @@ src/
   index.ts      — Entry point, CLI flags, orchestration loop
   jmap.ts       — Fastmail JMAP API client (session, queries, batch fetching, actions)
   classifier.ts — Claude-based email classification with detailed system prompt
-  db.ts         — PostgreSQL persistence (runs, classifications, action tracking)
+  db.ts         — PostgreSQL persistence (runs, classifications, corrections, action tracking)
   types.ts      — Shared TypeScript interfaces (EmailSummary, Tier, Classification, etc.)
+  correct.ts    — CLI for reviewing classifications and recording corrections
+  accuracy.ts   — CLI for viewing classification accuracy stats
 ```
 
 ### Data Flow
@@ -48,6 +50,18 @@ npm run triage -- --haiku
 
 # Continuous polling mode (60s interval)
 npm run triage -- --watch
+
+# Dry run — classify but don't apply any actions
+npm run triage -- --dry-run
+
+# Review classifications (interactive TUI — j/k navigate, 1-4 set tier, q quit)
+npm run correct
+
+# Record a correction directly
+npm run correct -- <email_id> <corrected_tier>
+
+# View classification accuracy stats
+npm run accuracy
 ```
 
 The project uses `tsx` to run TypeScript directly — there is no build step for development.
@@ -87,7 +101,20 @@ CREATE TABLE classifications (
   acted_at             TIMESTAMPTZ,
   PRIMARY KEY (email_id, run_id)
 );
+
+CREATE TABLE corrections (
+  correction_id        BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  email_id             TEXT NOT NULL,
+  run_id               BIGINT NOT NULL,
+  original_tier        TIER NOT NULL,
+  corrected_tier       TIER NOT NULL,
+  corrected_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  FOREIGN KEY (email_id, run_id) REFERENCES classifications(email_id, run_id),
+  UNIQUE (email_id, run_id)
+);
 ```
+
+Note: The `corrections` table is auto-created on first use by `npm run correct` or `npm run accuracy`.
 
 ## Code Conventions
 
@@ -122,7 +149,9 @@ CREATE TABLE classifications (
 - **Resumability**: Incomplete runs are detected and resumed — classified-but-unacted emails get retried
 - **Models**: `claude-sonnet-4-6` (default) or `claude-haiku-4-5-20251001` (via `--haiku` flag)
 - **Max tokens**: 4096 per classification request
+- **Dry run**: `--dry-run` flag classifies and persists to DB but skips all JMAP actions
 - **Watch mode**: 60-second polling interval, double SIGINT to force exit
+- **Corrections**: Record classification corrections via `npm run correct`, view accuracy via `npm run accuracy`
 - **DB connection**: SSL enabled with `rejectUnauthorized: false`
 
 ## Dependencies
