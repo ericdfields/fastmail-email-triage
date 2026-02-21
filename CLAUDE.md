@@ -54,10 +54,10 @@ npm run triage -- --watch
 # Dry run — classify but don't apply any actions
 npm run triage -- --dry-run
 
-# Review recent classifications
+# Review classifications (interactive TUI — j/k navigate, 1-4 set tier, q quit)
 npm run correct
 
-# Record a correction
+# Record a correction directly
 npm run correct -- <email_id> <corrected_tier>
 
 # View classification accuracy stats
