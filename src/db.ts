@@ -183,7 +183,7 @@ export async function getRecentClassifications(limit: number = 20) {
             c.tier, c.reason, c.has_list_unsubscribe, cr.corrected_tier
      FROM classifications c
      LEFT JOIN corrections cr ON c.email_id = cr.email_id AND c.run_id = cr.run_id
-     ORDER BY c.classified_at DESC
+     ORDER BY c.received_at DESC
      LIMIT $1`,
     [limit]
   );
