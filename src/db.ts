@@ -276,3 +276,104 @@ export async function getAccuracyStats() {
     })),
   };
 }
+
+// --- Attention Actions ---
+
+/** Create the attention_actions table if it doesn't exist. */
+export async function ensureAttentionActionsTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS attention_actions (
+      action_id     BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+      email_id      TEXT NOT NULL,
+      run_id        BIGINT NOT NULL,
+      action        TEXT NOT NULL CHECK (action IN ('acted', 'snoozed')),
+      note          TEXT,
+      snoozed_until TIMESTAMPTZ,
+      created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+      FOREIGN KEY (email_id, run_id) REFERENCES classifications(email_id, run_id)
+    )
+  `);
+}
+
+export type AttentionQueueRow = {
+  emailId: string;
+  runId: number;
+  subject: string;
+  from: string;
+  receivedAt: string;
+  reason: string;
+};
+
+/** Get attention-tier emails that still need processing. */
+export async function getAttentionQueue(limit: number): Promise<AttentionQueueRow[]> {
+  const result = await pool.query<{
+    email_id: string;
+    run_id: number;
+    subject: string;
+    sender: string;
+    received_at: string;
+    reason: string;
+  }>(
+    `WITH latest AS (
+       SELECT DISTINCT ON (email_id)
+         email_id, run_id, subject, sender, received_at, reason
+       FROM classifications
+       WHERE tier = 'attention'
+       ORDER BY email_id, classified_at DESC
+     )
+     SELECT l.*
+     FROM latest l
+     LEFT JOIN attention_actions aa
+       ON l.email_id = aa.email_id AND l.run_id = aa.run_id
+     WHERE aa.action_id IS NULL
+        OR (aa.action = 'snoozed' AND aa.snoozed_until <= now())
+     ORDER BY l.received_at ASC
+     LIMIT $1`,
+    [limit]
+  );
+
+  return result.rows.map((r) => ({
+    emailId: r.email_id,
+    runId: r.run_id,
+    subject: r.subject,
+    from: r.sender,
+    receivedAt: typeof r.received_at === "string" ? r.received_at : new Date(r.received_at).toISOString(),
+    reason: r.reason,
+  }));
+}
+
+/** Count total attention emails still needing processing. */
+export async function getAttentionQueueCount(): Promise<number> {
+  const result = await pool.query<{ count: string }>(
+    `WITH latest AS (
+       SELECT DISTINCT ON (email_id)
+         email_id, run_id, classified_at
+       FROM classifications
+       WHERE tier = 'attention'
+       ORDER BY email_id, classified_at DESC
+     )
+     SELECT COUNT(*)::text as count
+     FROM latest l
+     LEFT JOIN attention_actions aa
+       ON l.email_id = aa.email_id AND l.run_id = aa.run_id
+     WHERE aa.action_id IS NULL
+        OR (aa.action = 'snoozed' AND aa.snoozed_until <= now())`
+  );
+  return parseInt(result.rows[0]!.count);
+}
+
+/** Record that an attention email was acted on or snoozed. */
+export async function recordAttentionAction(
+  emailId: string,
+  runId: number,
+  action: "acted" | "snoozed",
+  note?: string,
+  snoozedUntil?: Date
+): Promise<void> {
+  await pool.query(
+    `INSERT INTO attention_actions (email_id, run_id, action, note, snoozed_until)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT DO NOTHING`,
+    [emailId, runId, action, note ?? null, snoozedUntil ?? null]
+  );
+}
