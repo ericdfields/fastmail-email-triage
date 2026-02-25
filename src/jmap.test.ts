@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 const mockFetch = vi.hoisted(() => vi.fn());
 vi.stubGlobal("fetch", mockFetch);
 
-import { getSession, getMailboxIds, applyActions, fetchAllUnread, fetchEmailBodies, archiveEmail } from "./jmap.js";
+import { getSession, getMailboxIds, applyActions, fetchAllUnread, fetchEmailBodies, archiveEmail, applyTierAction } from "./jmap.js";
 import type { Classification, JMAPSession, MailboxIds } from "./types.js";
 
 const session: JMAPSession = {
@@ -570,5 +570,62 @@ describe("archiveEmail", () => {
     const body = JSON.parse((mockFetch.mock.calls[0] as [string, { body: string }])[1].body);
     const update = body.methodCalls[0][1].update;
     expect(Object.keys(update)).toEqual(["email-xyz"]);
+  });
+});
+
+// --- applyTierAction ---
+
+describe("applyTierAction", () => {
+  it("sends correct Email/set for auto-delete", async () => {
+    mockFetch.mockResolvedValue(
+      makeJmapResponse([["Email/set", { updated: { "email-1": {} }, notUpdated: {} }, "tier0"]])
+    );
+
+    await applyTierAction(session, mailboxIds, "email-1", "auto-delete");
+
+    const body = JSON.parse((mockFetch.mock.calls[0] as [string, { body: string }])[1].body);
+    expect(body.methodCalls[0][1].update["email-1"]).toEqual({
+      "mailboxIds/inbox-1": null,
+      "mailboxIds/trash-1": true,
+    });
+  });
+
+  it("sends correct Email/set for auto-archive", async () => {
+    mockFetch.mockResolvedValue(
+      makeJmapResponse([["Email/set", { updated: { "email-1": {} }, notUpdated: {} }, "tier0"]])
+    );
+
+    await applyTierAction(session, mailboxIds, "email-1", "auto-archive");
+
+    const body = JSON.parse((mockFetch.mock.calls[0] as [string, { body: string }])[1].body);
+    expect(body.methodCalls[0][1].update["email-1"]).toEqual({
+      "mailboxIds/inbox-1": null,
+      "mailboxIds/archive-1": true,
+      "keywords/$seen": true,
+    });
+  });
+
+  it("sends correct Email/set for confirm", async () => {
+    mockFetch.mockResolvedValue(
+      makeJmapResponse([["Email/set", { updated: { "email-1": {} }, notUpdated: {} }, "tier0"]])
+    );
+
+    await applyTierAction(session, mailboxIds, "email-1", "confirm");
+
+    const body = JSON.parse((mockFetch.mock.calls[0] as [string, { body: string }])[1].body);
+    expect(body.methodCalls[0][1].update["email-1"]).toEqual({
+      "keywords/$seen": true,
+    });
+  });
+
+  it("uses the correct JMAP method call ID 'tier0'", async () => {
+    mockFetch.mockResolvedValue(
+      makeJmapResponse([["Email/set", { updated: { "email-1": {} }, notUpdated: {} }, "tier0"]])
+    );
+
+    await applyTierAction(session, mailboxIds, "email-1", "confirm");
+
+    const body = JSON.parse((mockFetch.mock.calls[0] as [string, { body: string }])[1].body);
+    expect(body.methodCalls[0][2]).toBe("tier0");
   });
 });
