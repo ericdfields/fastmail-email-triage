@@ -290,7 +290,8 @@ export async function ensureAttentionActionsTable() {
       note          TEXT,
       snoozed_until TIMESTAMPTZ,
       created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-      FOREIGN KEY (email_id, run_id) REFERENCES classifications(email_id, run_id)
+      FOREIGN KEY (email_id, run_id) REFERENCES classifications(email_id, run_id),
+      UNIQUE (email_id, run_id)
     )
   `);
 }
