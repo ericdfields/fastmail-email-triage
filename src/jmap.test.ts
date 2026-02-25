@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 const mockFetch = vi.hoisted(() => vi.fn());
 vi.stubGlobal("fetch", mockFetch);
 
-import { getSession, getMailboxIds, applyActions, fetchAllUnread } from "./jmap.js";
+import { getSession, getMailboxIds, applyActions, fetchAllUnread, fetchEmailBodies, archiveEmail } from "./jmap.js";
 import type { Classification, JMAPSession, MailboxIds } from "./types.js";
 
 const session: JMAPSession = {
@@ -363,5 +363,212 @@ describe("fetchAllUnread", () => {
     expect(batches).toHaveLength(2);
     expect(batches[0]).toHaveLength(50);
     expect(batches[1]).toHaveLength(1);
+  });
+});
+
+// --- fetchEmailBodies ---
+
+describe("fetchEmailBodies", () => {
+  it("returns an empty Map and skips the network call when emailIds is empty", async () => {
+    const result = await fetchEmailBodies(session, []);
+
+    expect(result.size).toBe(0);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it("requests the correct properties for the given email IDs", async () => {
+    mockFetch.mockResolvedValue(
+      makeJmapResponse([["Email/get", { list: [] }, "bodies0"]])
+    );
+
+    await fetchEmailBodies(session, ["e1", "e2"]);
+
+    const body = JSON.parse((mockFetch.mock.calls[0] as [string, { body: string }])[1].body);
+    const mc = body.methodCalls[0][1];
+    expect(mc.ids).toEqual(["e1", "e2"]);
+    expect(mc.properties).toContain("textBody");
+    expect(mc.properties).toContain("bodyValues");
+    expect(mc.fetchTextBodyValues).toBe(true);
+    expect(mc.maxBodyValueBytes).toBe(2048);
+  });
+
+  it("extracts text from the textBody part", async () => {
+    mockFetch.mockResolvedValue(
+      makeJmapResponse([
+        [
+          "Email/get",
+          {
+            list: [
+              {
+                id: "e1",
+                textBody: [{ partId: "1" }],
+                htmlBody: [],
+                bodyValues: { "1": { value: "Hello from text body" } },
+              },
+            ],
+          },
+          "bodies0",
+        ],
+      ])
+    );
+
+    const result = await fetchEmailBodies(session, ["e1"]);
+
+    expect(result.get("e1")).toBe("Hello from text body");
+  });
+
+  it("falls back to htmlBody with tag stripping when textBody is absent", async () => {
+    mockFetch.mockResolvedValue(
+      makeJmapResponse([
+        [
+          "Email/get",
+          {
+            list: [
+              {
+                id: "e1",
+                textBody: [],
+                htmlBody: [{ partId: "1" }],
+                bodyValues: { "1": { value: "<p>Hello <b>world</b></p>" } },
+              },
+            ],
+          },
+          "bodies0",
+        ],
+      ])
+    );
+
+    const result = await fetchEmailBodies(session, ["e1"]);
+
+    expect(result.get("e1")).toBe("Hello world");
+  });
+
+  it("prefers textBody over htmlBody when both are present", async () => {
+    mockFetch.mockResolvedValue(
+      makeJmapResponse([
+        [
+          "Email/get",
+          {
+            list: [
+              {
+                id: "e1",
+                textBody: [{ partId: "txt" }],
+                htmlBody: [{ partId: "html" }],
+                bodyValues: {
+                  txt: { value: "Plain text version" },
+                  html: { value: "<p>HTML version</p>" },
+                },
+              },
+            ],
+          },
+          "bodies0",
+        ],
+      ])
+    );
+
+    const result = await fetchEmailBodies(session, ["e1"]);
+
+    expect(result.get("e1")).toBe("Plain text version");
+  });
+
+  it("trims body text to 500 characters with ellipsis", async () => {
+    const longText = "a".repeat(600);
+    mockFetch.mockResolvedValue(
+      makeJmapResponse([
+        [
+          "Email/get",
+          {
+            list: [
+              {
+                id: "e1",
+                textBody: [{ partId: "1" }],
+                htmlBody: [],
+                bodyValues: { "1": { value: longText } },
+              },
+            ],
+          },
+          "bodies0",
+        ],
+      ])
+    );
+
+    const result = await fetchEmailBodies(session, ["e1"]);
+
+    expect(result.get("e1")).toHaveLength(500);
+    expect(result.get("e1")?.endsWith("...")).toBe(true);
+  });
+
+  it("returns empty string for emails with no body parts", async () => {
+    mockFetch.mockResolvedValue(
+      makeJmapResponse([
+        [
+          "Email/get",
+          {
+            list: [
+              {
+                id: "e1",
+                textBody: [],
+                htmlBody: [],
+                bodyValues: {},
+              },
+            ],
+          },
+          "bodies0",
+        ],
+      ])
+    );
+
+    const result = await fetchEmailBodies(session, ["e1"]);
+
+    expect(result.get("e1")).toBe("");
+  });
+});
+
+// --- archiveEmail ---
+
+describe("archiveEmail", () => {
+  it("sends Email/set to remove from inbox, add to archive, and mark read", async () => {
+    mockFetch.mockResolvedValue(
+      makeJmapResponse([
+        ["Email/set", { updated: { "email-1": {} }, notUpdated: {} }, "archive0"],
+      ])
+    );
+
+    await archiveEmail(session, mailboxIds, "email-1");
+
+    const body = JSON.parse((mockFetch.mock.calls[0] as [string, { body: string }])[1].body);
+    const update = body.methodCalls[0][1].update;
+    expect(update["email-1"]).toEqual({
+      "mailboxIds/inbox-1": null,
+      "mailboxIds/archive-1": true,
+      "keywords/$seen": true,
+    });
+  });
+
+  it("includes both JMAP core and mail capabilities", async () => {
+    mockFetch.mockResolvedValue(
+      makeJmapResponse([
+        ["Email/set", { updated: { "email-1": {} }, notUpdated: {} }, "archive0"],
+      ])
+    );
+
+    await archiveEmail(session, mailboxIds, "email-1");
+
+    const body = JSON.parse((mockFetch.mock.calls[0] as [string, { body: string }])[1].body);
+    expect(body.using).toContain("urn:ietf:params:jmap:core");
+    expect(body.using).toContain("urn:ietf:params:jmap:mail");
+  });
+
+  it("only updates the specified email ID", async () => {
+    mockFetch.mockResolvedValue(
+      makeJmapResponse([
+        ["Email/set", { updated: { "email-xyz": {} }, notUpdated: {} }, "archive0"],
+      ])
+    );
+
+    await archiveEmail(session, mailboxIds, "email-xyz");
+
+    const body = JSON.parse((mockFetch.mock.calls[0] as [string, { body: string }])[1].body);
+    const update = body.methodCalls[0][1].update;
+    expect(Object.keys(update)).toEqual(["email-xyz"]);
   });
 });
