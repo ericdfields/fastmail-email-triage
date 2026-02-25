@@ -8,6 +8,7 @@
     "triage": "doppler run -- tsx src/index.ts",
     "correct": "doppler run -- tsx src/correct.ts",
     "accuracy": "doppler run -- tsx src/accuracy.ts",
+    "act": "doppler run -- tsx src/act.ts",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
