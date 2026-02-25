@@ -336,3 +336,48 @@ export async function archiveEmail(
     ],
   });
 }
+
+/** Apply the standard tier action to a single email. */
+export async function applyTierAction(
+  session: JMAPSession,
+  mailboxIds: MailboxIds,
+  emailId: string,
+  tier: "auto-delete" | "auto-archive" | "confirm"
+): Promise<void> {
+  const update: Record<string, object> = {};
+
+  switch (tier) {
+    case "auto-delete":
+      update[emailId] = {
+        [`mailboxIds/${mailboxIds.inbox}`]: null,
+        [`mailboxIds/${mailboxIds.trash}`]: true,
+      };
+      break;
+    case "auto-archive":
+      update[emailId] = {
+        [`mailboxIds/${mailboxIds.inbox}`]: null,
+        [`mailboxIds/${mailboxIds.archive}`]: true,
+        "keywords/$seen": true,
+      };
+      break;
+    case "confirm":
+      update[emailId] = {
+        "keywords/$seen": true,
+      };
+      break;
+  }
+
+  await jmapRequest(session, {
+    using: ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+    methodCalls: [
+      [
+        "Email/set",
+        {
+          accountId: session.accountId,
+          update,
+        },
+        "tier0",
+      ],
+    ],
+  });
+}
