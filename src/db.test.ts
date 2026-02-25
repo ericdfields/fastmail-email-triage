@@ -19,6 +19,10 @@ import {
   findIncompleteRun,
   markActionsApplied,
   insertCorrection,
+  ensureAttentionActionsTable,
+  getAttentionQueue,
+  getAttentionQueueCount,
+  recordAttentionAction,
 } from "./db.js";
 import type { Classification } from "./types.js";
 
@@ -242,5 +246,171 @@ describe("closeDb", () => {
     mockEnd.mockResolvedValue(undefined);
     await closeDb();
     expect(mockEnd).toHaveBeenCalledOnce();
+  });
+});
+
+// --- ensureAttentionActionsTable ---
+
+describe("ensureAttentionActionsTable", () => {
+  it("issues a CREATE TABLE IF NOT EXISTS for attention_actions", async () => {
+    mockQuery.mockResolvedValue({ rows: [] });
+
+    await ensureAttentionActionsTable();
+
+    const [sql] = mockQuery.mock.calls[0] as [string];
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS attention_actions");
+  });
+
+  it("includes a UNIQUE constraint on (email_id, run_id)", async () => {
+    mockQuery.mockResolvedValue({ rows: [] });
+
+    await ensureAttentionActionsTable();
+
+    const [sql] = mockQuery.mock.calls[0] as [string];
+    expect(sql).toContain("UNIQUE (email_id, run_id)");
+  });
+});
+
+// --- getAttentionQueue ---
+
+describe("getAttentionQueue", () => {
+  it("returns empty array when no rows match", async () => {
+    mockQuery.mockResolvedValue({ rows: [] });
+
+    const result = await getAttentionQueue(5);
+
+    expect(result).toEqual([]);
+  });
+
+  it("passes limit as the query parameter", async () => {
+    mockQuery.mockResolvedValue({ rows: [] });
+
+    await getAttentionQueue(10);
+
+    const [, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+    expect(params).toEqual([10]);
+  });
+
+  it("maps DB columns to AttentionQueueRow shape correctly", async () => {
+    mockQuery.mockResolvedValue({
+      rows: [
+        {
+          email_id: "e1",
+          run_id: 42,
+          subject: "Hello",
+          sender: "alice@example.com",
+          received_at: "2024-06-01T10:00:00Z",
+          reason: "Real person",
+        },
+      ],
+    });
+
+    const result = await getAttentionQueue(5);
+
+    expect(result[0]).toEqual({
+      emailId: "e1",
+      runId: 42,
+      subject: "Hello",
+      from: "alice@example.com",
+      receivedAt: "2024-06-01T10:00:00Z",
+      reason: "Real person",
+    });
+  });
+
+  it("converts Date objects to ISO string for receivedAt", async () => {
+    const date = new Date("2024-06-01T10:00:00.000Z");
+    mockQuery.mockResolvedValue({
+      rows: [
+        {
+          email_id: "e1",
+          run_id: 1,
+          subject: "S",
+          sender: "s@s.com",
+          received_at: date,
+          reason: "R",
+        },
+      ],
+    });
+
+    const result = await getAttentionQueue(5);
+
+    expect(typeof result[0]?.receivedAt).toBe("string");
+    expect(result[0]?.receivedAt).toContain("2024-06-01");
+  });
+
+  it("queries using DISTINCT ON and LEFT JOIN attention_actions", async () => {
+    mockQuery.mockResolvedValue({ rows: [] });
+
+    await getAttentionQueue(5);
+
+    const [sql] = mockQuery.mock.calls[0] as [string];
+    expect(sql).toContain("DISTINCT ON");
+    expect(sql).toContain("attention_actions");
+    expect(sql).toContain("LEFT JOIN");
+  });
+});
+
+// --- getAttentionQueueCount ---
+
+describe("getAttentionQueueCount", () => {
+  it("returns 0 when no attention emails are pending", async () => {
+    mockQuery.mockResolvedValue({ rows: [{ count: "0" }] });
+
+    const result = await getAttentionQueueCount();
+
+    expect(result).toBe(0);
+  });
+
+  it("parses count string to a number", async () => {
+    mockQuery.mockResolvedValue({ rows: [{ count: "42" }] });
+
+    const result = await getAttentionQueueCount();
+
+    expect(result).toBe(42);
+  });
+});
+
+// --- recordAttentionAction ---
+
+describe("recordAttentionAction", () => {
+  it("inserts an acted record with null note and snoozedUntil when not provided", async () => {
+    mockQuery.mockResolvedValue({ rows: [] });
+
+    await recordAttentionAction("e1", 5, "acted");
+
+    const [sql, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+    expect(sql).toContain("INSERT INTO attention_actions");
+    expect(params).toEqual(["e1", 5, "acted", null, null]);
+  });
+
+  it("passes note as the fourth parameter when provided", async () => {
+    mockQuery.mockResolvedValue({ rows: [] });
+
+    await recordAttentionAction("e1", 5, "acted", "Called them back");
+
+    const [, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+    expect(params[3]).toBe("Called them back");
+    expect(params[4]).toBeNull();
+  });
+
+  it("inserts a snoozed record with snoozedUntil date", async () => {
+    mockQuery.mockResolvedValue({ rows: [] });
+    const until = new Date("2024-12-01T00:00:00.000Z");
+
+    await recordAttentionAction("e1", 5, "snoozed", undefined, until);
+
+    const [, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+    expect(params[2]).toBe("snoozed");
+    expect(params[3]).toBeNull();
+    expect(params[4]).toBe(until);
+  });
+
+  it("uses ON CONFLICT DO NOTHING for idempotency", async () => {
+    mockQuery.mockResolvedValue({ rows: [] });
+
+    await recordAttentionAction("e1", 5, "acted");
+
+    const [sql] = mockQuery.mock.calls[0] as [string];
+    expect(sql).toContain("ON CONFLICT DO NOTHING");
   });
 });
