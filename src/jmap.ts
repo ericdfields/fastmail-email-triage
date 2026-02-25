@@ -259,3 +259,85 @@ export async function applyActions(
     return { emailId: c.emailId, tier: c.tier, success: true };
   });
 }
+
+export type EmailBody = {
+  emailId: string;
+  text: string; // plain text, trimmed to ~500 chars
+};
+
+/** Fetch plain-text body for a batch of email IDs. */
+export async function fetchEmailBodies(
+  session: JMAPSession,
+  emailIds: string[]
+): Promise<Map<string, string>> {
+  if (emailIds.length === 0) return new Map();
+
+  const data = await jmapRequest(session, {
+    using: ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+    methodCalls: [
+      [
+        "Email/get",
+        {
+          accountId: session.accountId,
+          ids: emailIds,
+          properties: ["id", "textBody", "htmlBody", "bodyValues"],
+          fetchTextBodyValues: true,
+          fetchHTMLBodyValues: true,
+          maxBodyValueBytes: 2048,
+        },
+        "bodies0",
+      ],
+    ],
+  });
+
+  const result = new Map<string, string>();
+  const emails: any[] = data.methodResponses[0][1].list ?? [];
+
+  for (const email of emails) {
+    const bodyValues: Record<string, { value: string }> = email.bodyValues ?? {};
+
+    // Prefer text/plain part
+    let text = "";
+    if (email.textBody && email.textBody.length > 0) {
+      const partId = email.textBody[0].partId;
+      text = bodyValues[partId]?.value ?? "";
+    } else if (email.htmlBody && email.htmlBody.length > 0) {
+      const partId = email.htmlBody[0].partId;
+      const html = bodyValues[partId]?.value ?? "";
+      // Strip HTML tags
+      text = html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    }
+
+    // Trim to 500 chars
+    result.set(email.id, text.length > 500 ? text.substring(0, 497) + "..." : text);
+  }
+
+  return result;
+}
+
+/** Move a single email to archive and mark as read. */
+export async function archiveEmail(
+  session: JMAPSession,
+  mailboxIds: MailboxIds,
+  emailId: string
+): Promise<void> {
+  await jmapRequest(session, {
+    using: ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+    methodCalls: [
+      [
+        "Email/set",
+        {
+          accountId: session.accountId,
+          update: {
+            [emailId]: {
+              [`mailboxIds/${mailboxIds.inbox}`]: null,
+              [`mailboxIds/${mailboxIds.archive}`]: true,
+              "keywords/$seen": true,
+            },
+          },
+        },
+        "archive0",
+      ],
+    ],
+  });
+}
