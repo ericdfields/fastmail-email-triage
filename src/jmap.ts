@@ -260,11 +260,6 @@ export async function applyActions(
   });
 }
 
-export type EmailBody = {
-  emailId: string;
-  text: string; // plain text, trimmed to ~500 chars
-};
-
 /** Fetch plain-text body for a batch of email IDs. */
 export async function fetchEmailBodies(
   session: JMAPSession,
