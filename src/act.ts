@@ -50,7 +50,6 @@ async function main() {
   }
 
   const queue = await getAttentionQueue(batchSize);
-  const bodyMap = await fetchEmailBodies(session, queue.map((r) => r.emailId));
 
   if (!process.stdout.isTTY) {
     // Non-TTY fallback: plain list
@@ -66,6 +65,7 @@ async function main() {
     return;
   }
 
+  const bodyMap = await fetchEmailBodies(session, queue.map((r) => r.emailId));
   await launchTUI(session, mailboxIds, queue, bodyMap, batchSize, totalRemaining);
 }
 
