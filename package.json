@@ -8,6 +8,7 @@
     "triage": "doppler run -- tsx src/index.ts",
     "correct": "doppler run -- tsx src/correct.ts",
     "accuracy": "doppler run -- tsx src/accuracy.ts",
+    "act": "doppler run -- tsx src/act.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage"
