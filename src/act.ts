@@ -369,7 +369,12 @@ async function launchTUI(
         const row = queue[idx]!;
         busy = true;
         try {
-          await insertCorrection(row.emailId, tier);
+          const correction = await insertCorrection(row.emailId, tier);
+          if (!correction) {
+            showStatus("Error: no classification found for this email");
+            mode = { type: "list" };
+            return;
+          }
           await applyTierAction(session, mailboxIds, row.emailId, tier);
           await recordAttentionAction(row.emailId, row.runId, "acted");
           showStatus(`Reclassified \u2192 ${tier}`);
