@@ -78,11 +78,9 @@ const ESC = {
   bold: "\x1b[1m",
   dim: "\x1b[2m",
   reset: "\x1b[0m",
-  red: "\x1b[31m",
   green: "\x1b[32m",
   yellow: "\x1b[33m",
   cyan: "\x1b[36m",
-  blue: "\x1b[34m",
 };
 
 function truncate(s: string, max: number): string {
@@ -343,8 +341,9 @@ async function launchTUI(
         } catch (err) {
           showStatus(`Error: ${err}`);
           mode = { type: "list" };
+        } finally {
+          busy = false;
         }
-        busy = false;
         return;
       }
       return;
