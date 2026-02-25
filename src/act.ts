@@ -5,12 +5,14 @@ import {
   getAttentionQueue,
   getAttentionQueueCount,
   recordAttentionAction,
+  insertCorrection,
 } from "./db.js";
 import {
   getSession,
   getMailboxIds,
   fetchEmailBodies,
   archiveEmail,
+  applyTierAction,
 } from "./jmap.js";
 import type { JMAPSession, MailboxIds } from "./types.js";
 import type { AttentionQueueRow } from "./db.js";
@@ -78,6 +80,7 @@ const ESC = {
   bold: "\x1b[1m",
   dim: "\x1b[2m",
   reset: "\x1b[0m",
+  red: "\x1b[31m",
   green: "\x1b[32m",
   yellow: "\x1b[33m",
   cyan: "\x1b[36m",
@@ -97,6 +100,7 @@ type TUIMode =
   | { type: "list" }
   | { type: "note"; note: string }
   | { type: "snooze" }
+  | { type: "reclassify" }
   | { type: "batch-complete"; remaining: number };
 
 async function launchTUI(
@@ -199,6 +203,8 @@ async function launchTUI(
       s += `${ESC.bold}  Note (enter to skip, ctrl+c to cancel): ${mode.note}\u2588${ESC.reset}\n`;
     } else if (mode.type === "snooze") {
       s += `${ESC.bold}  Snooze: ${ESC.reset}${ESC.cyan}1${ESC.reset} Tomorrow  ${ESC.cyan}2${ESC.reset} Three days  ${ESC.cyan}3${ESC.reset} One week  ${ESC.dim}esc Cancel${ESC.reset}\n`;
+    } else if (mode.type === "reclassify") {
+      s += `${ESC.bold}  Reclassify: ${ESC.reset}${ESC.red}1${ESC.reset} auto-delete  ${ESC.yellow}2${ESC.reset} auto-archive  ${ESC.cyan}3${ESC.reset} confirm  ${ESC.dim}esc Cancel${ESC.reset}\n`;
     } else {
       s += "\n";
     }
@@ -209,6 +215,7 @@ async function launchTUI(
       s += `${ESC.dim}\u2191/\u2193${ESC.reset} Navigate  `;
       s += `${ESC.green}a${ESC.reset}${ESC.dim} Act${ESC.reset}  `;
       s += `${ESC.yellow}s${ESC.reset}${ESC.dim} Snooze${ESC.reset}  `;
+      s += `${ESC.red}r${ESC.reset}${ESC.dim} Reclassify${ESC.reset}  `;
       s += `${ESC.dim}q${ESC.reset} Quit`;
     }
 
@@ -301,7 +308,7 @@ async function launchTUI(
 
     // Ctrl+C
     if (key === "\x03") {
-      if (mode.type === "note") {
+      if (mode.type === "note" || mode.type === "reclassify") {
         mode = { type: "list" };
         render();
         return;
@@ -337,6 +344,35 @@ async function launchTUI(
           await recordAttentionAction(row.emailId, row.runId, "snoozed", undefined, snoozedUntil);
           const label = days === 1 ? "tomorrow" : days === 3 ? "3 days" : "1 week";
           showStatus(`Snoozed until ${label}`);
+          removeCurrentAndAdvance();
+        } catch (err) {
+          showStatus(`Error: ${err}`);
+          mode = { type: "list" };
+        } finally {
+          busy = false;
+        }
+        return;
+      }
+      return;
+    }
+
+    // --- Reclassify mode ---
+    if (mode.type === "reclassify") {
+      if (key === "\x1b") {
+        mode = { type: "list" };
+        render();
+        return;
+      }
+      if (key === "1" || key === "2" || key === "3") {
+        const tier =
+          key === "1" ? "auto-delete" : key === "2" ? "auto-archive" : "confirm";
+        const row = queue[idx]!;
+        busy = true;
+        try {
+          await insertCorrection(row.emailId, tier);
+          await applyTierAction(session, mailboxIds, row.emailId, tier);
+          await recordAttentionAction(row.emailId, row.runId, "acted");
+          showStatus(`Reclassified \u2192 ${tier}`);
           removeCurrentAndAdvance();
         } catch (err) {
           showStatus(`Error: ${err}`);
@@ -400,6 +436,12 @@ async function launchTUI(
 
     if (key === "s") {
       mode = { type: "snooze" };
+      render();
+      return;
+    }
+
+    if (key === "r") {
+      mode = { type: "reclassify" };
       render();
       return;
     }
