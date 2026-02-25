@@ -185,7 +185,7 @@ async function launchTUI(
     // Detail panel
     s += dimLine(w) + "\n";
     const r = queue[idx]!;
-    const body = bodyMap.get(r.emailId) ?? "(no body preview)";
+    const body = (bodyMap.get(r.emailId) ?? "(no body preview)").replace(/\s+/g, " ").trim();
     s += `${ESC.dim}Body:${ESC.reset}   ${truncate(body, w - 8)}\n`;
     if (body.length > w - 8) {
       s += `        ${ESC.dim}${truncate(body.substring(w - 8), w - 8)}${ESC.reset}\n`;

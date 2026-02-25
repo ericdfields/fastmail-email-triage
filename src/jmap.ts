@@ -295,7 +295,7 @@ export async function fetchEmailBodies(
     let text = "";
     if (email.textBody && email.textBody.length > 0) {
       const partId = email.textBody[0].partId;
-      text = bodyValues[partId]?.value ?? "";
+      text = (bodyValues[partId]?.value ?? "").replace(/\s+/g, " ").trim();
     } else if (email.htmlBody && email.htmlBody.length > 0) {
       const partId = email.htmlBody[0].partId;
       const html = bodyValues[partId]?.value ?? "";
