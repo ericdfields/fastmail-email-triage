@@ -9,7 +9,8 @@
         <string>/opt/homebrew/bin/doppler</string>
         <string>run</string>
         <string>--</string>
-        <string>/opt/homebrew/bin/tsx</string>
+        <string>/Users/ericbrookfield/.asdf/shims/npx</string>
+        <string>tsx</string>
         <string>src/index.ts</string>
     </array>
     <key>WorkingDirectory</key>

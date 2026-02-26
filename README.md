@@ -75,15 +75,110 @@ This will:
 
 If classification fails for a batch, those emails get a fallback `confirm` tier with no action applied.
 
+The classifier automatically learns from corrections — recent corrections (aggregated by sender, up to 50) are injected into the prompt as in-context examples.
+
+### Web UI
+
+Review and correct classifications from your phone (or any browser):
+
+```
+npm run server
+```
+
+Opens a web server on port 3100 with a mobile-friendly dark-themed UI for browsing classifications and correcting tiers.
+
+### Review (terminal)
+
+```
+npm run correct
+```
+
+Interactive TUI for reviewing classifications. `j`/`k` to navigate, `1`-`4` to set tier, `q` to quit.
+
+### Cleanup
+
+Archive all read inbox emails older than 1 month:
+
+```
+npm run cleanup
+npm run cleanup -- --dry-run
+```
+
+### CLI flags
+
+| Flag | Description |
+|------|-------------|
+| `--haiku` | Use cheaper/faster Claude Haiku model |
+| `--watch` | Continuous polling mode (60s interval) |
+| `--dry-run` | Classify but don't apply any JMAP actions |
+
+## Scheduled triage (Mac Studio)
+
+The system runs unattended via launchd. Three services:
+
+| Service | What it does | Restart policy |
+|---------|-------------|----------------|
+| `com.email-triage.server` | Web UI on port 3100 | Always running (KeepAlive) |
+| `com.email-triage.triage` | Triage job every 60 minutes | RunAtLoad + StartInterval |
+| `com.email-triage.tunnel` | Cloudflare Tunnel | Always running (KeepAlive) |
+
+### Install services
+
+```bash
+# Symlink plists
+ln -s "$(pwd)/launchd/com.email-triage.server.plist" ~/Library/LaunchAgents/
+ln -s "$(pwd)/launchd/com.email-triage.triage.plist" ~/Library/LaunchAgents/
+ln -s "$(pwd)/launchd/com.email-triage.tunnel.plist" ~/Library/LaunchAgents/
+
+# Load (start)
+launchctl load ~/Library/LaunchAgents/com.email-triage.server.plist
+launchctl load ~/Library/LaunchAgents/com.email-triage.triage.plist
+launchctl load ~/Library/LaunchAgents/com.email-triage.tunnel.plist
+
+# Check status
+launchctl list | grep email-triage
+
+# View logs
+tail -f ~/Library/Logs/email-triage-server.log
+tail -f ~/Library/Logs/email-triage-triage.log
+
+# Unload (stop)
+launchctl unload ~/Library/LaunchAgents/com.email-triage.server.plist
+launchctl unload ~/Library/LaunchAgents/com.email-triage.triage.plist
+launchctl unload ~/Library/LaunchAgents/com.email-triage.tunnel.plist
+```
+
+### Cloudflare Tunnel setup (one-time)
+
+1. Install cloudflared: `brew install cloudflared`
+2. Login: `cloudflared tunnel login`
+3. Create tunnel: `cloudflared tunnel create email-triage`
+4. Configure `~/.cloudflared/config.yml`:
+   ```yaml
+   tunnel: <tunnel-id>
+   credentials-file: ~/.cloudflared/<tunnel-id>.json
+   ingress:
+     - hostname: triage.yourdomain.com
+       service: http://localhost:3100
+     - service: http_status:404
+   ```
+5. Add DNS: `cloudflared tunnel route dns email-triage triage.yourdomain.com`
+6. Set up a Cloudflare Access policy in the Zero Trust dashboard to protect `triage.yourdomain.com`
+
 ## Project structure
 
 ```
 src/
   index.ts      — Entry point, orchestrates triage flow
   jmap.ts       — Fastmail JMAP client (session, mailbox queries, email fetching, actions)
-  classifier.ts — Claude-based email classification
-  db.ts         — PostgreSQL persistence (runs, classifications, action tracking)
+  classifier.ts — Claude-based email classification (with correction feedback)
+  db.ts         — PostgreSQL persistence (runs, classifications, corrections, accuracy)
+  server.ts     — Hono web server for mobile classification review UI
+  cleanup.ts    — Standalone inbox cleanup (archive stale read emails)
+  correct.ts    — Terminal TUI for classification review
+  accuracy.ts   — Classification accuracy stats
   types.ts      — Shared TypeScript interfaces
+launchd/        — launchd plist files for scheduled services
 ```
 
 ## Resumability

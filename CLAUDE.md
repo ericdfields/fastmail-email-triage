@@ -10,11 +10,14 @@ Fastmail Email Triage is an automated email classification system that uses Clau
 src/
   index.ts      — Entry point, CLI flags, orchestration loop
   jmap.ts       — Fastmail JMAP API client (session, queries, batch fetching, actions)
-  classifier.ts — Claude-based email classification with detailed system prompt
+  classifier.ts — Claude-based email classification with detailed system prompt and correction feedback
   db.ts         — PostgreSQL persistence (runs, classifications, corrections, action tracking)
   types.ts      — Shared TypeScript interfaces (EmailSummary, Tier, Classification, etc.)
-  correct.ts    — CLI for reviewing classifications and recording corrections
+  server.ts     — Hono web server for mobile classification review UI (port 3100)
+  cleanup.ts    — Standalone inbox cleanup (archive stale read emails older than 1 month)
+  correct.ts    — Terminal TUI for reviewing classifications and recording corrections
   accuracy.ts   — CLI for viewing classification accuracy stats
+launchd/        — launchd plist files for scheduled services (server, triage, tunnel)
 ```
 
 ### Data Flow
@@ -62,6 +65,13 @@ npm run correct -- <email_id> <corrected_tier>
 
 # View classification accuracy stats
 npm run accuracy
+
+# Start web UI server (port 3100)
+npm run server
+
+# Archive read emails older than 1 month
+npm run cleanup
+npm run cleanup -- --dry-run
 ```
 
 The project uses `tsx` to run TypeScript directly — there is no build step for development.
@@ -152,11 +162,15 @@ Note: The `corrections` table is auto-created on first use by `npm run correct` 
 - **Dry run**: `--dry-run` flag classifies and persists to DB but skips all JMAP actions
 - **Watch mode**: 60-second polling interval, double SIGINT to force exit
 - **Corrections**: Record classification corrections via `npm run correct`, view accuracy via `npm run accuracy`
+- **Correction feedback**: Classifier reads recent corrections (aggregated by sender, up to 50) and includes them as in-context examples
+- **Web UI**: Hono server on port 3100, mobile-friendly dark-themed UI for reviewing/correcting classifications
+- **Cleanup**: `npm run cleanup` archives read inbox emails older than 1 month (supports `--dry-run`)
+- **Scheduled services**: launchd plists in `launchd/` for server, hourly triage, and Cloudflare Tunnel
 - **DB connection**: SSL enabled with `rejectUnauthorized: false`
 
 ## Dependencies
 
-**Runtime**: `@anthropic-ai/sdk`, `pg`, `tsx`, `typescript`
+**Runtime**: `@anthropic-ai/sdk`, `hono`, `@hono/node-server`, `pg`, `tsx`, `typescript`
 **Dev**: `@types/node`, `@types/pg`
 
 ## Testing
