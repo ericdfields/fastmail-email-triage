@@ -23,7 +23,7 @@ export async function getSession(): Promise<JMAPSession> {
 
 const MAX_RETRIES = 3;
 
-async function jmapRequest(session: JMAPSession, body: object): Promise<any> {
+export async function jmapRequest(session: JMAPSession, body: object): Promise<any> {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
       const response = await fetch(session.apiUrl, {
