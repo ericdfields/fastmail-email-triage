@@ -9,6 +9,8 @@ import {
   markActionsApplied,
   completeRun,
   getRunSummary,
+  getRecentCorrections,
+  ensureCorrectionsTable,
 } from "./db.js";
 import type { Classification, MailboxIds } from "./types.js";
 
@@ -27,6 +29,7 @@ async function main() {
   console.log(`Model: ${model}${watchMode ? " (watch mode)" : ""}${dryRun ? " (dry run)" : ""}`);
 
   initDb();
+  await ensureCorrectionsTable();
 
   // Check for an incomplete run to resume
   const partial = await findIncompleteRun();
@@ -87,6 +90,11 @@ async function main() {
     });
   }
 
+  const corrections = await getRecentCorrections();
+  if (corrections.length > 0) {
+    console.log(`Loaded ${corrections.length} correction patterns for classifier`);
+  }
+
   while (true) {
     let batchesThisPoll = 0;
 
@@ -114,7 +122,7 @@ async function main() {
       let isFallback = false;
 
       try {
-        classifications = await classifyBatch(newEmails, model);
+        classifications = await classifyBatch(newEmails, model, corrections);
       } catch (err) {
         console.error(`  Classification failed:`, err);
         classifications = newEmails.map((email) => ({

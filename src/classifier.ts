@@ -49,10 +49,29 @@ Return a JSON array. Each element:
 
 Return ONLY the JSON array, no markdown fences, no explanation outside the array.`;
 
+export interface CorrectionExample {
+  sender: string;
+  subject: string;
+  hasListUnsubscribe: boolean;
+  originalTier: string;
+  correctedTier: string;
+}
+
 export async function classifyBatch(
   emails: EmailSummary[],
-  model: string = "claude-sonnet-4-6"
+  model: string = "claude-sonnet-4-6",
+  corrections: CorrectionExample[] = []
 ): Promise<Classification[]> {
+  let systemPrompt = SYSTEM_PROMPT;
+
+  if (corrections.length > 0) {
+    const lines = corrections.map(
+      (c) =>
+        `- "${c.subject}" from ${c.sender}${c.hasListUnsubscribe ? " (has List-Unsubscribe)" : ""} was corrected from ${c.originalTier} → ${c.correctedTier}`
+    );
+    systemPrompt += `\n\n## Recent Corrections (learn from these)\n\nThe following classifications were manually corrected. Apply these patterns:\n${lines.join("\n")}`;
+  }
+
   const userMessage = emails.map((e) => ({
     emailId: e.id,
     subject: e.subject,
@@ -67,7 +86,7 @@ export async function classifyBatch(
   const response = await anthropic.messages.create({
     model,
     max_tokens: 4096,
-    system: SYSTEM_PROMPT,
+    system: systemPrompt,
     messages: [
       {
         role: "user",
