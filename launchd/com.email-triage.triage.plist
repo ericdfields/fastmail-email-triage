@@ -9,8 +9,8 @@
         <string>/opt/homebrew/bin/doppler</string>
         <string>run</string>
         <string>--</string>
-        <string>/Users/ericbrookfield/.asdf/shims/npx</string>
-        <string>tsx</string>
+        <string>/Users/ericbrookfield/.asdf/installs/nodejs/22.14.0/bin/node</string>
+        <string>node_modules/.bin/tsx</string>
         <string>src/index.ts</string>
     </array>
     <key>WorkingDirectory</key>
