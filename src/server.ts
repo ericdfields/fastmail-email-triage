@@ -816,17 +816,17 @@ app.get("/", (c) => {
     </button>
   </header>
   <div class="tabs">
-    <button class="tab active" data-tab="review">Review</button>
-    <button class="tab" data-tab="attention">Attention <span class="tab-badge" id="attnBadge"></span></button>
+    <button class="tab active" data-tab="attention">Attention <span class="tab-badge" id="attnBadge"></span></button>
+    <button class="tab" data-tab="review">Review</button>
   </div>
-  <div class="view active" id="reviewView">
+  <div class="view" id="reviewView">
     <div class="list" id="list"></div>
     <div class="load-more-wrap" id="loadMoreWrap" style="display:none">
       <button class="btn-load-more" id="loadMoreBtn">Load more</button>
     </div>
     <div class="empty" id="empty" style="display:none">No classifications yet.</div>
   </div>
-  <div class="view" id="attentionView">
+  <div class="view active" id="attentionView">
     <div class="list" id="attnList"></div>
     <div class="load-more-wrap" id="attnLoadMoreWrap" style="display:none">
       <button class="btn-load-more" id="attnLoadMoreBtn">Load more</button>
@@ -851,7 +851,8 @@ app.get("/", (c) => {
   // Attention state
   let attnItems = [];
   let attnLoading = false;
-  let activeTab = 'review';
+  let activeTab = 'attention';
+  let reviewLoaded = false;
 
   const listEl = document.getElementById('list');
   const emptyEl = document.getElementById('empty');
@@ -1075,6 +1076,10 @@ app.get("/", (c) => {
       attentionView.classList.toggle('active', target === 'attention');
       if (target === 'attention' && attnItems.length === 0) {
         loadAttention(true);
+      }
+      if (target === 'review' && !reviewLoaded) {
+        reviewLoaded = true;
+        loadClassifications(true);
       }
     });
   });
@@ -1350,7 +1355,7 @@ app.get("/", (c) => {
   attnLoadMoreBtn.addEventListener('click', function() { loadAttention(false); });
 
   // Initial load
-  loadClassifications(true);
+  loadAttention(true);
   loadAttentionCount();
 })();
 </script>
