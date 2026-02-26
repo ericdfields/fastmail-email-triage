@@ -276,3 +276,31 @@ export async function getAccuracyStats() {
     })),
   };
 }
+
+/** Get recent corrections aggregated by sender (most recent per unique sender, capped at 50). */
+export async function getRecentCorrections(limit: number = 50) {
+  const result = await pool.query<{
+    sender: string;
+    subject: string;
+    has_list_unsubscribe: boolean;
+    original_tier: Tier;
+    corrected_tier: Tier;
+  }>(
+    `SELECT DISTINCT ON (c.sender)
+            c.sender, c.subject, c.has_list_unsubscribe,
+            cr.original_tier, cr.corrected_tier
+     FROM corrections cr
+     JOIN classifications c ON cr.email_id = c.email_id AND cr.run_id = c.run_id
+     ORDER BY c.sender, cr.corrected_at DESC
+     LIMIT $1`,
+    [limit]
+  );
+
+  return result.rows.map((r) => ({
+    sender: r.sender,
+    subject: r.subject,
+    hasListUnsubscribe: r.has_list_unsubscribe,
+    originalTier: r.original_tier,
+    correctedTier: r.corrected_tier,
+  }));
+}
