@@ -10,6 +10,7 @@
     "accuracy": "doppler run -- tsx src/accuracy.ts",
     "cleanup": "doppler run -- tsx src/cleanup.ts",
     "server": "doppler run -- tsx src/server.ts",
+    "restart": "./bin/restart-server",
     "act": "doppler run -- tsx src/act.ts",
     "test": "vitest run",
     "test:watch": "vitest",

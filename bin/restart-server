@@ -1,0 +1,4 @@
+#!/bin/bash
+launchctl unload ~/Library/LaunchAgents/com.email-triage.server.plist
+launchctl load ~/Library/LaunchAgents/com.email-triage.server.plist
+echo "Server restarted"
