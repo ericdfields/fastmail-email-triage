@@ -193,6 +193,7 @@ async function main() {
   console.log(`  attention:    ${summary.counts["attention"] ?? 0}`);
 
   await closeDb();
+  process.exit(0);
 }
 
 main().catch(async (err) => {

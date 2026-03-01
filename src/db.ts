@@ -7,7 +7,7 @@ let pool: pg.Pool;
 
 export function initDb() {
   if (!process.env.DATABASE_URL) throw new Error("Missing DATABASE_URL");
-  pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+  pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false }, max: 3 });
 }
 
 export async function closeDb() {
