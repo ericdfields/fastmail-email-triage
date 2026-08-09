@@ -4,7 +4,7 @@ const mockFetch = vi.hoisted(() => vi.fn());
 vi.stubGlobal("fetch", mockFetch);
 
 import { getSession, getMailboxIds, applyActions, fetchAllUnread, fetchEmailBodies, archiveEmail, applyTierAction } from "./jmap.js";
-import type { Classification, JMAPSession, MailboxIds } from "./types.js";
+import type { Classification, EmailSummary, JMAPSession, MailboxIds } from "./types.js";
 
 const session: JMAPSession = {
   apiUrl: "https://api.fastmail.com/jmap/api/",
@@ -298,7 +298,7 @@ describe("fetchAllUnread", () => {
   it("yields a single batch and stops", async () => {
     mockFetch.mockResolvedValue(makeEmailBatch([{ id: "e1", hasUnsub: false }]));
 
-    const batches: Awaited<ReturnType<typeof fetchAllUnread>>[] = [];
+    const batches: EmailSummary[][] = [];
     for await (const batch of fetchAllUnread(session, "inbox-1")) {
       batches.push(batch);
     }
@@ -316,7 +316,7 @@ describe("fetchAllUnread", () => {
       ])
     );
 
-    const batches: Awaited<ReturnType<typeof fetchAllUnread>>[] = [];
+    const batches: EmailSummary[][] = [];
     for await (const batch of fetchAllUnread(session, "inbox-1")) {
       batches.push(batch);
     }
@@ -355,7 +355,7 @@ describe("fetchAllUnread", () => {
       )
       .mockResolvedValueOnce(makeEmailBatch(secondBatch));
 
-    const batches: Awaited<ReturnType<typeof fetchAllUnread>>[] = [];
+    const batches: EmailSummary[][] = [];
     for await (const batch of fetchAllUnread(session, "inbox-1")) {
       batches.push(batch);
     }
