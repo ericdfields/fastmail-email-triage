@@ -1,178 +1,201 @@
 # CLAUDE.md
 
-## Project Overview
+Guidance for Claude Code (and any other agent) working in this repository.
 
-Fastmail Email Triage is an automated email classification system that uses Claude AI to triage unread emails from a Fastmail inbox via the JMAP protocol. It classifies emails into four tiers and applies corresponding actions automatically, with full run tracking and resumability via PostgreSQL.
+## Read this first
+
+- **This repo is public.** Never commit secrets, connection strings, or real email
+  content. `.claude/settings.local.json` is gitignored because approved-command entries
+  can capture connection strings — leave it that way.
+- **Secrets come from Doppler, not `.env`.** Every npm script is wrapped in
+  `doppler run --`. Running `tsx src/foo.ts` bare will fail on missing env vars.
+- **This system deletes and archives real mail.** Use `--dry-run` when testing triage
+  changes. `--dry-run` still classifies and writes to the DB; it only skips JMAP actions.
+- **The database is the valuable asset**, not the code. It holds the full classification
+  and correction history that makes the classifier good. Don't run destructive SQL against
+  it, and don't point the app at a fresh DB without saying so.
+
+## Project overview
+
+Automated email triage: fetches unread mail from a Fastmail inbox over JMAP, classifies it
+into four tiers with Claude, applies tier actions, and persists everything to Postgres for
+resumability and accuracy tracking. A second, human-driven pass works through the
+`attention` pile.
 
 ## Architecture
 
 ```
 src/
-  index.ts      — Entry point, CLI flags, orchestration loop
-  jmap.ts       — Fastmail JMAP API client (session, queries, batch fetching, actions)
-  classifier.ts — Claude-based email classification with detailed system prompt and correction feedback
-  db.ts         — PostgreSQL persistence (runs, classifications, corrections, action tracking)
-  types.ts      — Shared TypeScript interfaces (EmailSummary, Tier, Classification, etc.)
-  server.ts     — Hono web server for mobile classification review UI (port 3100)
-  cleanup.ts    — Standalone inbox cleanup (archive stale read emails older than 1 month)
-  correct.ts    — Terminal TUI for reviewing classifications and recording corrections
-  accuracy.ts   — CLI for viewing classification accuracy stats
-launchd/        — launchd plist files for scheduled services (server, triage, tunnel)
+  index.ts      — Triage entry point, CLI flags, orchestration loop
+  jmap.ts       — Fastmail JMAP client (session, queries, batch fetching, actions)
+  classifier.ts — Claude classification: system prompt + correction feedback
+  db.ts         — Postgres persistence (runs, classifications, corrections, attention)
+  types.ts      — Shared TypeScript interfaces (EmailSummary, Tier, Classification, ...)
+  server.ts     — Hono web server + inline mobile UI (port 3100)
+  act.ts        — Attention-queue TUI: act / snooze / reclassify
+  correct.ts    — Classification review TUI
+  accuracy.ts   — Accuracy stats CLI
+  cleanup.ts    — Standalone inbox cleanup (archive read mail older than 1 month)
+  *.test.ts     — Vitest unit tests for jmap, db, classifier
+db/schema.sql   — Full schema, idempotent
+launchd/        — launchd plists for scheduled services
+docs/plans/     — Design + implementation notes for shipped features
+bin/restart-server — Reload the launchd server job
 ```
 
-### Data Flow
+`server.ts` is ~1400 lines because the entire mobile UI (HTML, CSS, JS) is a template
+literal inside it. There is no frontend build step. Expect to scroll.
 
-1. Connect to Fastmail JMAP, get mailbox IDs (inbox, archive, trash)
-2. Check for incomplete runs to resume (retry pending actions)
+### Triage data flow
+
+1. Connect to Fastmail JMAP, resolve inbox / archive / trash mailbox IDs
+2. Check for an incomplete run to resume; retry pending actions first
 3. Fetch unread emails in batches of 50 via async generator
-4. Classify each batch with Claude (sonnet default, haiku via `--haiku`)
-5. Persist classifications to PostgreSQL
-6. Apply tier-based actions via JMAP `Email/set`
-7. Print summary stats
+4. Classify each batch with Claude (Sonnet by default, Haiku via `--haiku`)
+5. Persist classifications to Postgres
+6. Apply tier actions via a single JMAP `Email/set` per batch
+7. Stamp `acted_at` for the emails whose actions succeeded
+8. Print summary; ping `UPTIME_KUMA_PUSH_URL` if set
 
-### Tier System
+### Tier system
 
-| Tier | Action | Use Case |
+| Tier | Action | Use case |
 |------|--------|----------|
 | `auto-delete` | Move to Trash | Spam, phishing, marketing |
 | `auto-archive` | Move to Archive + mark read | Newsletters, notifications, receipts |
 | `confirm` | Mark as read, keep in Inbox | Ambiguous messages needing human review |
 | `attention` | No action (keep unread) | Real people, bills, medical, orders |
 
-## Running the Project
+`attention` is intentionally inert during triage. Those emails are handled later by
+`npm run act` or the web UI's Attention tab, and `attention_actions` records the outcome.
+
+## Running the project
 
 ```bash
-# Install dependencies
 npm install
 
-# Run triage (uses Doppler for env vars)
-npm run triage
+npm run triage                    # classify + act on unread inbox mail
+npm run triage -- --dry-run       # classify + persist, no JMAP actions
+npm run triage -- --haiku         # cheaper/faster model
+npm run triage -- --watch         # poll every 60s; SIGINT finishes the batch
 
-# Use cheaper/faster model
-npm run triage -- --haiku
+npm run act                       # attention-queue TUI (default 5 per batch)
+npm run act -- --batch 10         # larger sitting
 
-# Continuous polling mode (60s interval)
-npm run triage -- --watch
+npm run correct                   # review classifications (j/k navigate, 1-4 set tier, q quit)
+npm run correct -- <email_id> <corrected_tier>   # record one correction directly
+npm run accuracy                  # correction-rate stats
 
-# Dry run — classify but don't apply any actions
-npm run triage -- --dry-run
+npm run server                    # web UI + JSON API on port 3100
+npm run restart                   # reload the launchd server job (macOS)
 
-# Review classifications (interactive TUI — j/k navigate, 1-4 set tier, q quit)
-npm run correct
-
-# Record a correction directly
-npm run correct -- <email_id> <corrected_tier>
-
-# View classification accuracy stats
-npm run accuracy
-
-# Start web UI server (port 3100)
-npm run server
-
-# Archive read emails older than 1 month
-npm run cleanup
+npm run cleanup                   # archive read inbox mail older than 1 month
 npm run cleanup -- --dry-run
+
+npm test                          # vitest run
+npm run test:watch
+npm run test:coverage
+npx tsc --noEmit                  # typecheck; should be silent
 ```
 
-The project uses `tsx` to run TypeScript directly — there is no build step for development.
+`tsx` runs the TypeScript directly — there is no build step.
 
-## Environment Variables
+## Environment variables
 
-Managed via [Doppler](https://doppler.com). The `npm run triage` script wraps execution with `doppler run --`:
+Managed via [Doppler](https://doppler.com). `doppler login && doppler setup` once per
+machine.
 
 - `FASTMAIL_API_TOKEN` — Fastmail API token with mail read/write access
-- `ANTHROPIC_API_KEY` — Anthropic API key for Claude classification
-- `DATABASE_URL` — PostgreSQL connection string (`postgresql://user:password@host:port/db`)
+- `ANTHROPIC_API_KEY` — Anthropic API key for classification
+- `DATABASE_URL` — Postgres connection string
+- `UPTIME_KUMA_PUSH_URL` — optional heartbeat pinged after a successful triage run
 
-## Database Schema
+## Database schema
 
-PostgreSQL with a custom `tier` ENUM type and two tables:
+Postgres, a `tier` ENUM, and four tables. The authoritative DDL is
+[`db/schema.sql`](db/schema.sql) — **update that file when you change the schema.**
 
-```sql
-CREATE TYPE tier AS ENUM ('auto-delete', 'auto-archive', 'confirm', 'attention');
+| Table | Purpose |
+|-------|---------|
+| `triage_runs` | One row per invocation. `completed_at IS NULL` marks a resumable run |
+| `classifications` | PK `(email_id, run_id)`. `acted_at` stamped only after JMAP succeeds |
+| `corrections` | Human overrides; fed back into the classifier prompt |
+| `attention_actions` | `acted` / `snoozed` per attention email, with optional note and `snoozed_until` |
 
-CREATE TABLE triage_runs (
-  run_id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  started_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-  completed_at   TIMESTAMPTZ,
-  total_processed INTEGER NOT NULL DEFAULT 0
-);
+`corrections` and `attention_actions` are auto-created at runtime
+(`ensureCorrectionsTable`, `ensureAttentionActionsTable`). `triage_runs` and
+`classifications` are not — a fresh database needs `db/schema.sql` first.
 
-CREATE TABLE classifications (
-  email_id             TEXT NOT NULL,
-  run_id               BIGINT NOT NULL REFERENCES triage_runs(run_id),
-  subject              TEXT NOT NULL,
-  sender               TEXT NOT NULL,
-  received_at          TIMESTAMPTZ NOT NULL,
-  tier                 TIER NOT NULL,
-  reason               TEXT NOT NULL,
-  has_list_unsubscribe BOOLEAN NOT NULL DEFAULT false,
-  classified_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-  acted_at             TIMESTAMPTZ,
-  PRIMARY KEY (email_id, run_id)
-);
+The attention queue query takes the latest classification per `email_id`
+(`DISTINCT ON ... ORDER BY classified_at DESC`), then excludes anything with an
+`attention_actions` row unless it is a snooze whose `snoozed_until` has passed.
 
-CREATE TABLE corrections (
-  correction_id        BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  email_id             TEXT NOT NULL,
-  run_id               BIGINT NOT NULL,
-  original_tier        TIER NOT NULL,
-  corrected_tier       TIER NOT NULL,
-  corrected_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-  FOREIGN KEY (email_id, run_id) REFERENCES classifications(email_id, run_id),
-  UNIQUE (email_id, run_id)
-);
-```
-
-Note: The `corrections` table is auto-created on first use by `npm run correct` or `npm run accuracy`.
-
-## Code Conventions
+## Code conventions
 
 ### TypeScript
 
-- **Strict mode** enabled with `exactOptionalPropertyTypes` and `noUncheckedIndexedAccess`
-- **ES modules** — `"type": "module"` in package.json, `verbatimModuleSyntax` in tsconfig
-- **Import extensions** — Always use `.js` extensions in imports (e.g., `from "./jmap.js"`)
-- **Type-only imports** — Use `import type { ... }` for type-only imports
-- Target: ES2022, Module: nodenext
+- **Strict mode** with `exactOptionalPropertyTypes` and `noUncheckedIndexedAccess` — hence
+  the `!` and `?? null` noise around indexed access; keep it rather than loosening tsconfig
+- **ES modules** — `"type": "module"`, `verbatimModuleSyntax`
+- **Import extensions** — always `.js` in imports (e.g. `from "./jmap.js"`)
+- **Type-only imports** — `import type { ... }`
+- Target ES2022, module nodenext
 
 ### Style
 
 - Async/await throughout, no raw Promise chains
 - Explicit type annotations on exported functions
 - Destructuring for imports and object access
-- `try/catch` error handling with contextual error messages
-- Functional patterns (map/filter/reduce) over imperative loops where appropriate
-- No linter or formatter configured — follow existing code style
-- Console logging for progress tracking (batch counts, tier summaries)
+- `try/catch` with contextual error messages
+- Functional patterns (map/filter/reduce) where they read better
+- No linter or formatter configured — match the surrounding code
+- Console logging for progress (batch counts, tier summaries)
 
-### Error Handling Patterns
+### Error handling
 
-- Classification failures fall back to `confirm` tier (safe default, no auto-actions applied)
-- JMAP requests retry up to 3 times with linear backoff (2s, 4s, 6s) on `ETIMEDOUT`
-- Database inserts use `ON CONFLICT DO NOTHING` for idempotent classification storage
-- Watch mode supports graceful shutdown via SIGINT (finishes current batch)
-
-## Key Technical Details
-
-- **Batch size**: 50 emails per JMAP fetch, 500ms rate-limiting pause between batches
-- **Resumability**: Incomplete runs are detected and resumed — classified-but-unacted emails get retried
-- **Models**: `claude-sonnet-4-6` (default) or `claude-haiku-4-5-20251001` (via `--haiku` flag)
-- **Max tokens**: 4096 per classification request
-- **Dry run**: `--dry-run` flag classifies and persists to DB but skips all JMAP actions
-- **Watch mode**: 60-second polling interval, double SIGINT to force exit
-- **Corrections**: Record classification corrections via `npm run correct`, view accuracy via `npm run accuracy`
-- **Correction feedback**: Classifier reads recent corrections (aggregated by sender, up to 50) and includes them as in-context examples
-- **Web UI**: Hono server on port 3100, mobile-friendly dark-themed UI for reviewing/correcting classifications
-- **Cleanup**: `npm run cleanup` archives read inbox emails older than 1 month (supports `--dry-run`)
-- **Scheduled services**: launchd plists in `launchd/` for server, hourly triage, and Cloudflare Tunnel
-- **DB connection**: SSL enabled with `rejectUnauthorized: false`
-
-## Dependencies
-
-**Runtime**: `@anthropic-ai/sdk`, `hono`, `@hono/node-server`, `pg`, `tsx`, `typescript`
-**Dev**: `@types/node`, `@types/pg`
+- Classification failures fall back to `confirm` and **skip actions entirely** — a bad
+  batch can never delete mail
+- JMAP requests retry 3× with linear backoff (2s, 4s, 6s) on `ETIMEDOUT` only; other
+  errors fail fast
+- Classification inserts use `ON CONFLICT DO NOTHING` for idempotency
+- Watch mode: SIGINT finishes the current batch; a second SIGINT force-exits
+- `src/index.ts` calls `process.exit(0)` explicitly — the pg pool otherwise keeps the
+  event loop alive and the launchd job never ends
 
 ## Testing
 
-No test framework is configured. The `test` script is a placeholder.
+Vitest, 67 unit tests across `jmap.test.ts`, `db.test.ts`, and `classifier.test.ts`. They
+mock `fetch` and the pg pool — **no network, no database, no API keys required**, so
+`npm test` is safe to run anywhere and should be run before every commit.
+
+Not covered: `server.ts`, `act.ts`, `correct.ts`, `cleanup.ts`, and the end-to-end loop in
+`index.ts`. Changes there need manual verification — `npm run triage -- --dry-run` for
+triage, and the running server for UI work.
+
+## Key technical details
+
+- **Batch size**: 50 emails per JMAP fetch, 500ms pause between batches
+- **Models**: `claude-sonnet-4-6` default, `claude-haiku-4-5-20251001` via `--haiku`
+- **Max tokens**: 4096 per classification request
+- **Correction feedback**: the classifier loads recent corrections aggregated by sender
+  (up to 50, most recent per sender) and includes them as in-context examples. This is the
+  main learning loop — corrections recorded via `act`, `correct`, or the web UI all feed it
+- **Web UI**: Hono on port 3100, dark mobile UI, Attention tab default, Review lazy-loaded.
+  **No authentication** — it is meant to sit behind Cloudflare Access, not be exposed
+- **DB connection**: SSL with `rejectUnauthorized: false`, pool `max: 3` (keeps the hourly
+  launchd job from exhausting connections on the managed instance)
+- **Scheduled services**: launchd plists for server, hourly triage, and Cloudflare Tunnel.
+  They hardcode absolute paths for one machine — see the README before loading them
+  elsewhere. The absolute node path exists because launchd doesn't load asdf shims
+
+## Gotchas
+
+- Editing `src/server.ts` while the launchd server job is running does nothing until
+  `npm run restart`
+- `launchctl list | grep email-triage` — the middle column is the last exit code, not a
+  health check. `0` is good; anything else means look at the log
+- `npm run act` and `npm run correct` need a TTY. `act` has a plain-list fallback for
+  non-TTY, `correct` does not
+- Fastmail API tokens are scoped per account and are not transferable between accounts
+- Don't confuse `corrections` (the classifier's training signal) with `attention_actions`
+  (queue bookkeeping). Reclassifying in `act` writes both

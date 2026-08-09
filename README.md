@@ -1,131 +1,224 @@
 # Fastmail Email Triage
 
-Classifies unread Fastmail inbox emails into four tiers using Claude, then acts on them automatically via JMAP.
+Classifies unread Fastmail inbox emails into four tiers using Claude, then acts on them
+automatically via JMAP. Every classification is persisted to Postgres, so runs are
+resumable, correctable, and measurable.
+
+Two halves:
+
+- **Triage** (`npm run triage`) — the automated pass. Classifies unread mail and applies
+  actions. Runs hourly under launchd.
+- **Attention processing** (`npm run act`, or the web UI) — the human pass. Works through
+  the `attention` pile one email at a time: archive it, snooze it, or reclassify it.
 
 ## Tiers
 
-| Tier | Action |
-|------|--------|
-| `auto-delete` | Move to Trash |
-| `auto-archive` | Move to Archive, mark as read |
-| `confirm` | Mark as read, keep in Inbox |
-| `attention` | No action (keep unread in Inbox) |
+| Tier | Action | Typical senders |
+|------|--------|-----------------|
+| `auto-delete` | Move to Trash | Spam, phishing, cold marketing |
+| `auto-archive` | Move to Archive, mark as read | Newsletters, notifications, receipts |
+| `confirm` | Mark as read, keep in Inbox | Ambiguous — read it when convenient |
+| `attention` | **No action** (stays unread in Inbox) | Real people, bills, medical, orders |
 
-## Setup
+`attention` is deliberately inert. Nothing touches those emails until a human processes
+them via `npm run act` or the web UI.
 
-### Environment variables
+---
 
-Managed via [Doppler](https://doppler.com):
+## Setting up on a new machine
 
-- `FASTMAIL_API_TOKEN` — Fastmail API token with mail read/write access
-- `ANTHROPIC_API_KEY` — Anthropic API key for classification
-- `DATABASE_URL` — PostgreSQL connection string
+### 1. Prerequisites
 
-### Database
+| Tool | Notes |
+|------|-------|
+| Node.js 22+ | The launchd plists pin `nodejs 22.14.0` via asdf — see [launchd](#scheduled-services-macos-launchd) |
+| [Doppler CLI](https://docs.doppler.com/docs/install-cli) | `brew install dopplerhq/cli/doppler` — all secrets come from here, there is no `.env` |
+| PostgreSQL | Any Postgres 14+ host. Currently a managed instance; connection string lives in Doppler |
+| `psql` | Only needed once, to bootstrap the schema |
+| `cloudflared` | Optional — only for remote access to the web UI |
 
-PostgreSQL with two tables:
+### 2. Clone and install
 
-```sql
-CREATE TYPE tier AS ENUM ('auto-delete', 'auto-archive', 'confirm', 'attention');
-
-CREATE TABLE triage_runs (
-  run_id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  started_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-  completed_at   TIMESTAMPTZ,
-  total_processed INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE classifications (
-  email_id             TEXT NOT NULL,
-  run_id               BIGINT NOT NULL REFERENCES triage_runs(run_id),
-  subject              TEXT NOT NULL,
-  sender               TEXT NOT NULL,
-  received_at          TIMESTAMPTZ NOT NULL,
-  tier                 TIER NOT NULL,
-  reason               TEXT NOT NULL,
-  has_list_unsubscribe BOOLEAN NOT NULL DEFAULT false,
-  classified_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-  acted_at             TIMESTAMPTZ,
-  PRIMARY KEY (email_id, run_id)
-);
-```
-
-### Install
-
-```
+```bash
+git clone https://github.com/ericdfields/fastmail-email-triage.git
+cd fastmail-email-triage
 npm install
 ```
 
-## Usage
+There is no build step — `tsx` runs the TypeScript directly.
 
-### Triage
+### 3. Wire up Doppler
 
-Classify and act on all unread inbox emails:
-
+```bash
+doppler login
+doppler setup   # select the project + config for this app
+doppler secrets --only-names   # sanity check: should list the vars below
 ```
+
+Every `npm run` script is wrapped in `doppler run --`, so if this step is skipped every
+command fails with `Missing FASTMAIL_API_TOKEN` (or similar).
+
+### 4. Environment variables
+
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `FASTMAIL_API_TOKEN` | yes | Fastmail API token with **mail read/write** scope. Create at Fastmail → Settings → Privacy & Security → Integrations → API tokens |
+| `ANTHROPIC_API_KEY` | yes | Used for classification |
+| `DATABASE_URL` | yes | `postgresql://user:password@host:port/db` — SSL is enabled with `rejectUnauthorized: false` |
+| `UPTIME_KUMA_PUSH_URL` | no | Push-monitor URL. Pinged after a successful triage run so a missed run raises an alert |
+
+### 5. Bootstrap the database
+
+Pointing at an existing database? Skip this — the data is already there.
+
+For a fresh one:
+
+```bash
+doppler run -- bash -c 'psql "$DATABASE_URL" -f db/schema.sql'
+```
+
+`db/schema.sql` is idempotent and creates all four tables plus the `tier` enum. (The
+`corrections` and `attention_actions` tables are also auto-created at runtime, but
+`triage_runs` and `classifications` are not — they must exist before the first run.)
+
+### 6. Verify before letting it loose
+
+```bash
+npm test                    # 67 unit tests, no network or DB needed
+npx tsc --noEmit            # should be silent
+npm run triage -- --dry-run # classifies + writes to DB, applies NO JMAP actions
+```
+
+A clean `--dry-run` confirms the Fastmail token, the Anthropic key, and the database all
+work. Then run the real thing:
+
+```bash
 npm run triage
 ```
 
-This will:
-1. Check for an incomplete run to resume (retries any classified-but-unacted emails first)
-2. Fetch unread emails from Fastmail in batches of 50
-3. Classify each batch with Claude
-4. Apply tier actions via JMAP
-5. Print a summary
+---
 
-If classification fails for a batch, those emails get a fallback `confirm` tier with no action applied.
+## Commands
 
-The classifier automatically learns from corrections — recent corrections (aggregated by sender, up to 50) are injected into the prompt as in-context examples.
+| Command | What it does |
+|---------|-------------|
+| `npm run triage` | Classify and act on all unread inbox mail |
+| `npm run triage -- --dry-run` | Classify and persist, but apply no JMAP actions |
+| `npm run triage -- --haiku` | Use Haiku instead of Sonnet (cheaper, faster, less accurate) |
+| `npm run triage -- --watch` | Poll continuously every 60s (Ctrl-C finishes the batch; twice force-quits) |
+| `npm run act` | Terminal TUI for working the attention queue |
+| `npm run act -- --batch 10` | Same, 10 emails per sitting (default 5) |
+| `npm run correct` | Terminal TUI for reviewing recent classifications |
+| `npm run correct -- <email_id> <tier>` | Record one correction non-interactively |
+| `npm run accuracy` | Correction-rate stats, overall and per tier |
+| `npm run server` | Web UI + JSON API on port 3100 |
+| `npm run restart` | Reload the launchd server job (macOS only) |
+| `npm run cleanup` | Archive read inbox mail older than 1 month (`-- --dry-run` supported) |
+| `npm test` | Vitest suite (`test:watch`, `test:coverage` also available) |
+
+### Attention queue TUI (`npm run act`)
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` or ↓ / ↑ | Navigate |
+| `g` / `G` | Jump to first / last |
+| `a` | Mark acted — archives the email and records it |
+| `s` | Snooze — then `1`/`2`/`3` for 1, 3, or 7 days |
+| `r` | Reclassify — then `1`/`2`/`3` for auto-delete / auto-archive / confirm. Records a correction *and* applies the tier action |
+| `q` / Ctrl-C | Quit |
+
+Reclassifying here feeds the classifier: corrections become in-context examples on the
+next run.
 
 ### Web UI
 
-Review and correct classifications from your phone (or any browser):
-
-```
-npm run server
+```bash
+npm run server   # http://localhost:3100
 ```
 
-Opens a web server on port 3100 with a mobile-friendly dark-themed UI for browsing classifications and correcting tiers.
+Mobile-friendly dark UI with two tabs — **Attention** (the default; act / snooze /
+reclassify from your phone) and **Review** (lazy-loaded; browse and correct recent
+classifications).
 
-### Review (terminal)
+API routes, all JSON:
 
-```
-npm run correct
-```
+| Method | Route |
+|--------|-------|
+| `GET` | `/api/classifications` |
+| `POST` | `/api/corrections` |
+| `GET` | `/api/attention` |
+| `GET` | `/api/attention/count` |
+| `POST` | `/api/attention/act` |
+| `POST` | `/api/attention/snooze` |
+| `POST` | `/api/attention/reclassify` |
 
-Interactive TUI for reviewing classifications. `j`/`k` to navigate, `1`-`4` to set tier, `q` to quit.
+The server has **no authentication** — it is meant to sit behind Cloudflare Access. Do
+not expose port 3100 directly.
 
-### Cleanup
+---
 
-Archive all read inbox emails older than 1 month:
+## How triage works
 
-```
-npm run cleanup
-npm run cleanup -- --dry-run
-```
+1. Connect to Fastmail JMAP; resolve inbox / archive / trash mailbox IDs
+2. Look for an incomplete run to resume; retry any classified-but-unacted emails
+3. Fetch unread emails in batches of 50 (async generator)
+4. Classify each batch with Claude, with recent corrections injected as examples
+5. Persist classifications to Postgres
+6. Apply tier actions in one `Email/set` call per batch
+7. Stamp `acted_at` on the rows whose actions succeeded
+8. Print a summary and ping the Uptime Kuma heartbeat
 
-### CLI flags
+If classification fails for a batch, those emails fall back to `confirm` with **no action
+applied** — a failure can never delete mail.
 
-| Flag | Description |
-|------|-------------|
-| `--haiku` | Use cheaper/faster Claude Haiku model |
-| `--watch` | Continuous polling mode (60s interval) |
-| `--dry-run` | Classify but don't apply any JMAP actions |
+### Resumability
 
-## Scheduled triage (Mac Studio)
+`acted_at` is only stamped after JMAP confirms the action, so a crash anywhere in the
+loop is recoverable. On the next start:
 
-The system runs unattended via launchd. Three services:
+- The incomplete run (`completed_at IS NULL`) is detected and reused
+- Already-classified emails are skipped, so Claude isn't paid twice
+- Classified-but-unacted emails get their actions retried first
+- New batches continue from where they left off
+
+---
+
+## Database
+
+Four tables plus a `tier` enum — see [`db/schema.sql`](db/schema.sql) for the full DDL.
+
+| Table | Holds |
+|-------|-------|
+| `triage_runs` | One row per invocation; `completed_at IS NULL` means "resume me" |
+| `classifications` | One row per (email, run) — tier, reason, `acted_at` |
+| `corrections` | Human overrides; feed back into the classifier prompt |
+| `attention_actions` | Which attention emails were acted on or snoozed, and until when |
+
+---
+
+## Scheduled services (macOS launchd)
+
+Three jobs run the system unattended:
 
 | Service | What it does | Restart policy |
 |---------|-------------|----------------|
 | `com.email-triage.server` | Web UI on port 3100 | Always running (KeepAlive) |
-| `com.email-triage.triage` | Triage job every 60 minutes | RunAtLoad + StartInterval |
+| `com.email-triage.triage` | Triage run every 60 minutes | RunAtLoad + StartInterval |
 | `com.email-triage.tunnel` | Cloudflare Tunnel | Always running (KeepAlive) |
 
-### Install services
+> **The plists contain absolute paths for one specific machine.** Before loading them on
+> a new box, edit all three files in `launchd/` and update:
+>
+> - `WorkingDirectory` → wherever the repo is cloned
+> - the `node` path (currently `/Users/ericbrookfield/.asdf/installs/nodejs/22.14.0/bin/node`)
+> - `/opt/homebrew/bin/doppler` and `/opt/homebrew/bin/cloudflared` (Intel Macs use `/usr/local/bin`)
+> - `StandardOutPath` / `StandardErrorPath`
+>
+> The absolute node path is deliberate: launchd doesn't run a login shell, so asdf shims
+> aren't on `PATH`. Find yours with `asdf which node`.
 
 ```bash
-# Symlink plists
+# Symlink
 ln -s "$(pwd)/launchd/com.email-triage.server.plist" ~/Library/LaunchAgents/
 ln -s "$(pwd)/launchd/com.email-triage.triage.plist" ~/Library/LaunchAgents/
 ln -s "$(pwd)/launchd/com.email-triage.tunnel.plist" ~/Library/LaunchAgents/
@@ -135,24 +228,24 @@ launchctl load ~/Library/LaunchAgents/com.email-triage.server.plist
 launchctl load ~/Library/LaunchAgents/com.email-triage.triage.plist
 launchctl load ~/Library/LaunchAgents/com.email-triage.tunnel.plist
 
-# Check status
+# Status — second column is the last exit code; 0 is healthy
 launchctl list | grep email-triage
 
-# View logs
+# Logs
 tail -f ~/Library/Logs/email-triage-server.log
 tail -f ~/Library/Logs/email-triage-triage.log
 
 # Unload (stop)
 launchctl unload ~/Library/LaunchAgents/com.email-triage.server.plist
-launchctl unload ~/Library/LaunchAgents/com.email-triage.triage.plist
-launchctl unload ~/Library/LaunchAgents/com.email-triage.tunnel.plist
 ```
 
-### Cloudflare Tunnel setup (one-time)
+After editing `src/server.ts`, `npm run restart` reloads the server job.
 
-1. Install cloudflared: `brew install cloudflared`
-2. Login: `cloudflared tunnel login`
-3. Create tunnel: `cloudflared tunnel create email-triage`
+### Cloudflare Tunnel (one-time)
+
+1. `brew install cloudflared`
+2. `cloudflared tunnel login`
+3. `cloudflared tunnel create email-triage`
 4. Configure `~/.cloudflared/config.yml`:
    ```yaml
    tunnel: <tunnel-id>
@@ -162,29 +255,43 @@ launchctl unload ~/Library/LaunchAgents/com.email-triage.tunnel.plist
        service: http://localhost:3100
      - service: http_status:404
    ```
-5. Add DNS: `cloudflared tunnel route dns email-triage triage.yourdomain.com`
-6. Set up a Cloudflare Access policy in the Zero Trust dashboard to protect `triage.yourdomain.com`
+5. `cloudflared tunnel route dns email-triage triage.yourdomain.com`
+6. Add a Cloudflare Access policy for `triage.yourdomain.com` — the app itself has no auth
+
+Tunnel credentials live in `~/.cloudflared/` and are **not** in this repo. Moving to a new
+machine means re-running steps 1–2 and copying the credentials file (or creating a new
+tunnel).
+
+---
 
 ## Project structure
 
 ```
 src/
-  index.ts      — Entry point, orchestrates triage flow
-  jmap.ts       — Fastmail JMAP client (session, mailbox queries, email fetching, actions)
-  classifier.ts — Claude-based email classification (with correction feedback)
-  db.ts         — PostgreSQL persistence (runs, classifications, corrections, accuracy)
-  server.ts     — Hono web server for mobile classification review UI
-  cleanup.ts    — Standalone inbox cleanup (archive stale read emails)
-  correct.ts    — Terminal TUI for classification review
-  accuracy.ts   — Classification accuracy stats
-  types.ts      — Shared TypeScript interfaces
-launchd/        — launchd plist files for scheduled services
+  index.ts      — Triage entry point: CLI flags, orchestration loop
+  jmap.ts       — Fastmail JMAP client (session, queries, batch fetch, actions)
+  classifier.ts — Claude classification: system prompt + correction feedback
+  db.ts         — Postgres persistence (runs, classifications, corrections, attention)
+  types.ts      — Shared interfaces (EmailSummary, Tier, Classification, ...)
+  server.ts     — Hono web server + embedded mobile UI (port 3100)
+  act.ts        — Attention-queue TUI (act / snooze / reclassify)
+  correct.ts    — Classification review TUI
+  accuracy.ts   — Accuracy stats CLI
+  cleanup.ts    — Archive stale read inbox mail
+  *.test.ts     — Vitest unit tests (jmap, db, classifier)
+db/schema.sql   — Full schema; idempotent bootstrap
+launchd/        — launchd plists (machine-specific paths — see above)
+docs/plans/     — Design + implementation notes for shipped features
+bin/restart-server — Reload the launchd server job
 ```
 
-## Resumability
+## What lives outside this repo
 
-Runs are resumable. If the process crashes mid-run:
-- The incomplete run is detected on next start
-- Already-classified emails are skipped
-- Classified-but-unacted emails get their actions retried
-- New batches continue from where they left off
+Taking the project over means bringing these along:
+
+- **Doppler project** — all four secrets. Nothing here works without it.
+- **Postgres database** — the entire classification and correction history. The
+  classifier gets meaningfully better from accumulated corrections; a fresh DB starts cold.
+- **Fastmail API token** — machine-agnostic, but scoped to one account.
+- **Cloudflare Tunnel credentials** — `~/.cloudflared/`.
+- **launchd jobs** — per-machine, and the plists need path edits.

@@ -1,0 +1,79 @@
+-- Fastmail Email Triage — full database schema.
+--
+-- Bootstrap a fresh database with:
+--   psql "$DATABASE_URL" -f db/schema.sql
+--
+-- Safe to re-run: every statement is idempotent.
+--
+-- Note: `corrections` and `attention_actions` are also created on demand at
+-- runtime (ensureCorrectionsTable / ensureAttentionActionsTable in src/db.ts).
+-- `triage_runs` and `classifications` are NOT — they must exist before the
+-- first `npm run triage`, which is what this file is for.
+
+-- Tier enum — mirrors the `Tier` union in src/types.ts.
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'tier') THEN
+    CREATE TYPE tier AS ENUM ('auto-delete', 'auto-archive', 'confirm', 'attention');
+  END IF;
+END
+$$;
+
+-- One row per triage invocation. `completed_at IS NULL` marks a run that
+-- crashed mid-flight; the next run detects and resumes it.
+CREATE TABLE IF NOT EXISTS triage_runs (
+  run_id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  started_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  completed_at    TIMESTAMPTZ,
+  total_processed INTEGER NOT NULL DEFAULT 0
+);
+
+-- One row per (email, run). `acted_at` is stamped only after the JMAP action
+-- succeeds, so a crash between classify and act is recoverable.
+CREATE TABLE IF NOT EXISTS classifications (
+  email_id             TEXT NOT NULL,
+  run_id               BIGINT NOT NULL REFERENCES triage_runs(run_id),
+  subject              TEXT NOT NULL,
+  sender               TEXT NOT NULL,
+  received_at          TIMESTAMPTZ NOT NULL,
+  tier                 tier NOT NULL,
+  reason               TEXT NOT NULL,
+  has_list_unsubscribe BOOLEAN NOT NULL DEFAULT false,
+  classified_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  acted_at             TIMESTAMPTZ,
+  PRIMARY KEY (email_id, run_id)
+);
+
+-- Human corrections to a classification. Fed back into the classifier prompt
+-- as in-context examples (aggregated by sender, most recent 50).
+CREATE TABLE IF NOT EXISTS corrections (
+  correction_id  BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  email_id       TEXT NOT NULL,
+  run_id         BIGINT NOT NULL,
+  original_tier  tier NOT NULL,
+  corrected_tier tier NOT NULL,
+  corrected_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  FOREIGN KEY (email_id, run_id) REFERENCES classifications(email_id, run_id),
+  UNIQUE (email_id, run_id)
+);
+
+-- Tracks which attention-tier emails have been dealt with (or snoozed).
+-- Drives the attention queue in `npm run act` and the web UI's Attention tab:
+-- an email leaves the queue once it has a row here that isn't a live snooze.
+CREATE TABLE IF NOT EXISTS attention_actions (
+  action_id     BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  email_id      TEXT NOT NULL,
+  run_id        BIGINT NOT NULL,
+  action        TEXT NOT NULL CHECK (action IN ('acted', 'snoozed')),
+  note          TEXT,
+  snoozed_until TIMESTAMPTZ,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  FOREIGN KEY (email_id, run_id) REFERENCES classifications(email_id, run_id),
+  UNIQUE (email_id, run_id)
+);
+
+-- Hot paths: the attention queue and the review list both scan by tier and
+-- order by recency.
+CREATE INDEX IF NOT EXISTS classifications_tier_idx ON classifications (tier);
+CREATE INDEX IF NOT EXISTS classifications_received_at_idx ON classifications (received_at DESC);
+CREATE INDEX IF NOT EXISTS classifications_email_classified_idx ON classifications (email_id, classified_at DESC);

@@ -3,3 +3,10 @@ dist/
 .env
 output/
 .worktrees/
+
+# Local Claude Code state — settings.local.json accumulates approved commands,
+# which can include connection strings. Never commit it (this repo is public).
+.claude/settings.local.json
+
+.DS_Store
+*.log
