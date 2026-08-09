@@ -112,8 +112,8 @@ async function launchTUI() {
 
   function visibleCount(): number {
     const termHeight = stdout.rows || 24;
-    // Reserve: header(2) + scroll indicator(1) + separator(1) + detail(2) + message(2) + separator(1) + help(1) = 10
-    return Math.max(1, Math.floor((termHeight - 10) / 2));
+    // Reserve: header(2) + scroll indicator(1) + separator(1) + detail(2) + message(2) + separator(1) + help(4) = 13
+    return Math.max(1, Math.floor((termHeight - 13) / 2));
   }
 
   function render() {
@@ -183,12 +183,14 @@ async function launchTUI() {
 
     // Help bar
     s += dimLine("\u2500".repeat(w)) + "\n";
+    s += "\n";
     s += `${ESC.dim}\u2191/\u2193${ESC.reset} Navigate  `;
     s += `${ESC.red}1${ESC.reset}${ESC.dim} delete${ESC.reset}  `;
     s += `${ESC.yellow}2${ESC.reset}${ESC.dim} archive${ESC.reset}  `;
     s += `${ESC.cyan}3${ESC.reset}${ESC.dim} confirm${ESC.reset}  `;
     s += `${ESC.green}4${ESC.reset}${ESC.dim} attention${ESC.reset}  `;
     s += `${ESC.dim}q${ESC.reset} Quit`;
+    s += "\n\n";
 
     stdout.write(s);
   }
