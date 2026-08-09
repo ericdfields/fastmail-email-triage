@@ -192,6 +192,16 @@ async function main() {
   console.log(`  confirm:      ${summary.counts["confirm"] ?? 0}`);
   console.log(`  attention:    ${summary.counts["attention"] ?? 0}`);
 
+  // Ping Uptime Kuma heartbeat
+  if (process.env.UPTIME_KUMA_PUSH_URL) {
+    try {
+      await fetch(`${process.env.UPTIME_KUMA_PUSH_URL}?status=up&msg=OK&ping=`);
+      console.log("Uptime Kuma heartbeat sent");
+    } catch (err) {
+      console.error("Uptime Kuma heartbeat failed:", err);
+    }
+  }
+
   await closeDb();
   process.exit(0);
 }
