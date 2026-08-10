@@ -1,6 +1,6 @@
 # Fastmail Email Triage
 
-Classifies unread Fastmail inbox emails into four tiers using Claude, then acts on them
+Classifies unread Fastmail inbox emails into four tiers through OpenRouter, then acts on them
 automatically via JMAP. Every classification is persisted to Postgres, so runs are
 resumable, correctable, and measurable.
 
@@ -63,7 +63,8 @@ command fails with `Missing FASTMAIL_API_TOKEN` (or similar).
 | Variable | Required | Purpose |
 |----------|----------|---------|
 | `FASTMAIL_API_TOKEN` | yes | Fastmail API token with **mail read/write** scope. Create at Fastmail → Settings → Privacy & Security → Integrations → API tokens |
-| `ANTHROPIC_API_KEY` | yes | Used for classification |
+| `OPENROUTER_API_KEY` | yes | Used for primary and backup classification models |
+| `OPENROUTER_DAILY_BUDGET_USD` | no | Daily model-call circuit breaker; defaults to `$1.00` |
 | `DATABASE_URL` | yes | `postgresql://user:password@host:port/db` — SSL is enabled with `rejectUnauthorized: false` |
 | `UPTIME_KUMA_PUSH_URL` | no | Push-monitor URL. Pinged after a successful triage run so a missed run raises an alert |
 
@@ -77,19 +78,19 @@ For a fresh one:
 doppler run -- bash -c 'psql "$DATABASE_URL" -f db/schema.sql'
 ```
 
-`db/schema.sql` is idempotent and creates all four tables plus the `tier` enum. (The
-`corrections` and `attention_actions` tables are also auto-created at runtime, but
+`db/schema.sql` is idempotent and creates all six tables plus the `tier` enum. (The
+`corrections`, `attention_actions`, `sender_rules`, and `model_calls` tables are also auto-created at runtime, but
 `triage_runs` and `classifications` are not — they must exist before the first run.)
 
 ### 6. Verify before letting it loose
 
 ```bash
-npm test                    # 67 unit tests, no network or DB needed
+npm test                    # unit tests, no network or DB needed
 npx tsc --noEmit            # should be silent
-npm run triage -- --dry-run # classifies + writes to DB, applies NO JMAP actions
+npm run triage -- --dry-run # classifies + reports, writes no classifications or mail actions
 ```
 
-A clean `--dry-run` confirms the Fastmail token, the Anthropic key, and the database all
+A clean `--dry-run` confirms the Fastmail token, the OpenRouter key, and the database all
 work. Then run the real thing:
 
 ```bash
@@ -103,8 +104,7 @@ npm run triage
 | Command | What it does |
 |---------|-------------|
 | `npm run triage` | Classify and act on all unread inbox mail |
-| `npm run triage -- --dry-run` | Classify and persist, but apply no JMAP actions |
-| `npm run triage -- --haiku` | Use Haiku instead of Sonnet (cheaper, faster, less accurate) |
+| `npm run triage -- --dry-run` | Classify and report, but persist no classifications or JMAP actions |
 | `npm run triage -- --watch` | Poll continuously every 60s (Ctrl-C finishes the batch; twice force-quits) |
 | `npm run act` | Terminal TUI for working the attention queue |
 | `npm run act -- --batch 10` | Same, 10 emails per sitting (default 5) |
@@ -127,8 +127,8 @@ npm run triage
 | `r` | Reclassify — then `1`/`2`/`3` for auto-delete / auto-archive / confirm. Records a correction *and* applies the tier action |
 | `q` / Ctrl-C | Quit |
 
-Reclassifying here feeds the classifier: corrections become in-context examples on the
-next run.
+Reclassifying here creates an exact-sender rule. Future messages from that sender bypass
+the model; domain-wide rules are never inferred automatically.
 
 ### Web UI
 
@@ -161,15 +161,15 @@ not expose port 3100 directly.
 
 1. Connect to Fastmail JMAP; resolve inbox / archive / trash mailbox IDs
 2. Look for an incomplete run to resume; retry any classified-but-unacted emails
-3. Fetch unread emails in batches of 50 (async generator)
-4. Classify each batch with Claude, with recent corrections injected as examples
-5. Persist classifications to Postgres
-6. Apply tier actions in one `Email/set` call per batch
-7. Stamp `acted_at` on the rows whose actions succeeded
-8. Print a summary and ping the Uptime Kuma heartbeat
+3. Fetch unread emails in batches of 50 and skip IDs genuinely classified in any prior run
+4. Apply exact-sender rules, then auto-archive remaining `List-Unsubscribe` mail locally
+5. Classify only the remaining mail with GPT-5.6 Luna through OpenRouter
+6. Retry a failed model request once with Claude Haiku 4.5, then abort the run
+7. Persist classifications and apply tier actions in one `Email/set` call per batch
+8. Record token/cost/latency usage, print a summary, and ping the Uptime Kuma heartbeat
 
-If classification fails for a batch, those emails fall back to `confirm` with **no action
-applied** — a failure can never delete mail.
+If both model attempts fail, the run stops, sends a failed heartbeat, and writes no fake
+classification. The affected emails remain unread for the next scheduled retry.
 
 ### Resumability
 
@@ -177,7 +177,8 @@ applied** — a failure can never delete mail.
 loop is recoverable. On the next start:
 
 - The incomplete run (`completed_at IS NULL`) is detected and reused
-- Already-classified emails are skipped, so Claude isn't paid twice
+- Already-classified email IDs are skipped across all runs, so attention mail stays queued
+  without being repeatedly sent to a model
 - Classified-but-unacted emails get their actions retried first
 - New batches continue from where they left off
 
@@ -185,14 +186,16 @@ loop is recoverable. On the next start:
 
 ## Database
 
-Four tables plus a `tier` enum — see [`db/schema.sql`](db/schema.sql) for the full DDL.
+Six tables plus a `tier` enum — see [`db/schema.sql`](db/schema.sql) for the full DDL.
 
 | Table | Holds |
 |-------|-------|
 | `triage_runs` | One row per invocation; `completed_at IS NULL` means "resume me" |
 | `classifications` | One row per (email, run) — tier, reason, `acted_at` |
-| `corrections` | Human overrides; feed back into the classifier prompt |
+| `corrections` | Human overrides and the audit trail for sender rules |
 | `attention_actions` | Which attention emails were acted on or snoozed, and until when |
+| `sender_rules` | Exact normalized sender decisions learned from explicit corrections |
+| `model_calls` | Per-attempt model, token, cache, cost, latency, and failure accounting |
 
 ---
 
@@ -270,15 +273,16 @@ tunnel).
 src/
   index.ts      — Triage entry point: CLI flags, orchestration loop
   jmap.ts       — Fastmail JMAP client (session, queries, batch fetch, actions)
-  classifier.ts — Claude classification: system prompt + correction feedback
-  db.ts         — Postgres persistence (runs, classifications, corrections, attention)
+  classifier.ts — OpenRouter structured classification with one backup attempt
+  routing.ts    — deterministic sender and List-Unsubscribe routing
+  db.ts         — Postgres persistence, deduplication, rules, and model accounting
   types.ts      — Shared interfaces (EmailSummary, Tier, Classification, ...)
   server.ts     — Hono web server + embedded mobile UI (port 3100)
   act.ts        — Attention-queue TUI (act / snooze / reclassify)
   correct.ts    — Classification review TUI
   accuracy.ts   — Accuracy stats CLI
   cleanup.ts    — Archive stale read inbox mail
-  *.test.ts     — Vitest unit tests (jmap, db, classifier)
+  *.test.ts     — Vitest unit tests (jmap, db, routing, classifier)
 db/schema.sql   — Full schema; idempotent bootstrap
 launchd/        — launchd plists (machine-specific paths — see above)
 docs/plans/     — Design + implementation notes for shipped features
@@ -289,9 +293,9 @@ bin/restart-server — Reload the launchd server job
 
 Taking the project over means bringing these along:
 
-- **Doppler project** — all four secrets. Nothing here works without it.
+- **Doppler project** — runtime secrets. Nothing here works without it.
 - **Postgres database** — the entire classification and correction history. The
-  classifier gets meaningfully better from accumulated corrections; a fresh DB starts cold.
+  exact-sender routing gets meaningfully better from accumulated corrections; a fresh DB starts cold.
 - **Fastmail API token** — machine-agnostic, but scoped to one account.
 - **Cloudflare Tunnel credentials** — `~/.cloudflared/`.
 - **launchd jobs** — per-machine, and the plists need path edits.

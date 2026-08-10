@@ -19,6 +19,11 @@ import {
   findIncompleteRun,
   markActionsApplied,
   insertCorrection,
+  ensureOptimizationTables,
+  getPreviouslyClassifiedEmailIds,
+  getSenderRules,
+  getTodayModelSpend,
+  recordModelCall,
   ensureAttentionActionsTable,
   getAttentionQueue,
   getAttentionQueueCount,
@@ -212,6 +217,7 @@ describe("insertCorrection", () => {
       .mockResolvedValueOnce({
         rows: [{ run_id: 5, tier: "auto-archive", subject: "Newsletter", sender: "news@example.com" }],
       })
+      .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [] });
 
     const result = await insertCorrection("email-1", "attention");
@@ -229,6 +235,7 @@ describe("insertCorrection", () => {
       .mockResolvedValueOnce({
         rows: [{ run_id: 7, tier: "confirm", subject: "S", sender: "s@s.com" }],
       })
+      .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [] });
 
     await insertCorrection("email-abc", "attention");
@@ -236,6 +243,97 @@ describe("insertCorrection", () => {
     const [sql, params] = mockQuery.mock.calls[1] as [string, unknown[]];
     expect(sql).toContain("INSERT INTO corrections");
     expect(params).toEqual(["email-abc", 7, "confirm", "attention"]);
+  });
+
+  it("upserts an exact normalized sender rule", async () => {
+    mockQuery
+      .mockResolvedValueOnce({
+        rows: [{ run_id: 7, tier: "confirm", subject: "S", sender: " Sender@Example.COM " }],
+      })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] });
+
+    await insertCorrection("email-abc", "auto-archive");
+
+    const [sql, params] = mockQuery.mock.calls[2] as [string, unknown[]];
+    expect(sql).toContain("INSERT INTO sender_rules");
+    expect(sql).toContain("ON CONFLICT");
+    expect(params).toEqual(["sender@example.com", "auto-archive"]);
+  });
+});
+
+// --- token-efficiency persistence ---
+
+describe("ensureOptimizationTables", () => {
+  it("creates sender rules, model calls, and migrates correction history", async () => {
+    mockQuery.mockResolvedValue({ rows: [] });
+
+    await ensureOptimizationTables();
+
+    const sql = mockQuery.mock.calls.map((call) => call[0]).join("\n");
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS sender_rules");
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS model_calls");
+    expect(sql).toContain("INSERT INTO sender_rules");
+  });
+});
+
+describe("getPreviouslyClassifiedEmailIds", () => {
+  it("returns genuine classifications and excludes legacy fallback rows in SQL", async () => {
+    mockQuery.mockResolvedValue({ rows: [{ email_id: "e1" }, { email_id: "e3" }] });
+
+    const ids = await getPreviouslyClassifiedEmailIds(["e1", "e2", "e3"]);
+
+    expect([...ids]).toEqual(["e1", "e3"]);
+    const [sql, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+    expect(sql).toContain("reason <>");
+    expect(params).toEqual([["e1", "e2", "e3"]]);
+  });
+
+  it("does not query for an empty batch", async () => {
+    await expect(getPreviouslyClassifiedEmailIds([])).resolves.toEqual(new Set());
+    expect(mockQuery).not.toHaveBeenCalled();
+  });
+});
+
+describe("getSenderRules", () => {
+  it("normalizes and deduplicates sender keys", async () => {
+    mockQuery.mockResolvedValue({ rows: [{ sender: "sender@example.com", tier: "attention" }] });
+
+    const rules = await getSenderRules([" Sender@Example.com ", "sender@example.com"]);
+
+    expect(rules.get("sender@example.com")).toBe("attention");
+    const [, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+    expect(params).toEqual([["sender@example.com"]]);
+  });
+});
+
+describe("model call accounting", () => {
+  it("records one model attempt", async () => {
+    mockQuery.mockResolvedValue({ rows: [] });
+
+    await recordModelCall(42, {
+      model: "model-a",
+      attempt: 1,
+      success: true,
+      batchSize: 10,
+      latencyMs: 250,
+      usage: {
+        inputTokens: 100,
+        outputTokens: 20,
+        cacheReadTokens: 50,
+        cacheWriteTokens: 0,
+        costUsd: 0.0002,
+      },
+    });
+
+    const [sql, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+    expect(sql).toContain("INSERT INTO model_calls");
+    expect(params).toEqual([42, "model-a", 1, "success", 10, 100, 20, 50, 0, 0.0002, 250, null]);
+  });
+
+  it("returns today's accumulated model spend", async () => {
+    mockQuery.mockResolvedValue({ rows: [{ cost: "0.4321" }] });
+    await expect(getTodayModelSpend()).resolves.toBe(0.4321);
   });
 });
 

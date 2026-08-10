@@ -10,7 +10,8 @@ Guidance for Claude Code (and any other agent) working in this repository.
 - **Secrets come from Doppler, not `.env`.** Every npm script is wrapped in
   `doppler run --`. Running `tsx src/foo.ts` bare will fail on missing env vars.
 - **This system deletes and archives real mail.** Use `--dry-run` when testing triage
-  changes. `--dry-run` still classifies and writes to the DB; it only skips JMAP actions.
+  changes. `--dry-run` records model-call accounting but writes no classifications and
+  applies no JMAP actions.
 - **The database is the valuable asset**, not the code. It holds the full classification
   and correction history that makes the classifier good. Don't run destructive SQL against
   it, and don't point the app at a fresh DB without saying so.
@@ -18,7 +19,7 @@ Guidance for Claude Code (and any other agent) working in this repository.
 ## Project overview
 
 Automated email triage: fetches unread mail from a Fastmail inbox over JMAP, classifies it
-into four tiers with Claude, applies tier actions, and persists everything to Postgres for
+into four tiers through OpenRouter, applies tier actions, and persists everything to Postgres for
 resumability and accuracy tracking. A second, human-driven pass works through the
 `attention` pile.
 
@@ -28,8 +29,9 @@ resumability and accuracy tracking. A second, human-driven pass works through th
 src/
   index.ts      — Triage entry point, CLI flags, orchestration loop
   jmap.ts       — Fastmail JMAP client (session, queries, batch fetching, actions)
-  classifier.ts — Claude classification: system prompt + correction feedback
-  db.ts         — Postgres persistence (runs, classifications, corrections, attention)
+  classifier.ts — OpenRouter structured classification with primary/backup routing
+  routing.ts    — deterministic sender and List-Unsubscribe routing
+  db.ts         — Postgres persistence, deduplication, rules, and model accounting
   types.ts      — Shared TypeScript interfaces (EmailSummary, Tier, Classification, ...)
   server.ts     — Hono web server + inline mobile UI (port 3100)
   act.ts        — Attention-queue TUI: act / snooze / reclassify
@@ -51,11 +53,11 @@ literal inside it. There is no frontend build step. Expect to scroll.
 1. Connect to Fastmail JMAP, resolve inbox / archive / trash mailbox IDs
 2. Check for an incomplete run to resume; retry pending actions first
 3. Fetch unread emails in batches of 50 via async generator
-4. Classify each batch with Claude (Sonnet by default, Haiku via `--haiku`)
-5. Persist classifications to Postgres
-6. Apply tier actions via a single JMAP `Email/set` per batch
-7. Stamp `acted_at` for the emails whose actions succeeded
-8. Print summary; ping `UPTIME_KUMA_PUSH_URL` if set
+4. Skip IDs classified in any prior run; route exact senders and List-Unsubscribe locally
+5. Classify the remainder with GPT-5.6 Luna; retry once with Claude Haiku 4.5
+6. Persist classifications and per-attempt token/cost/latency accounting
+7. Apply tier actions via a single JMAP `Email/set` per batch
+8. Print summary; ping `UPTIME_KUMA_PUSH_URL` up or down
 
 ### Tier system
 
@@ -75,8 +77,7 @@ literal inside it. There is no frontend build step. Expect to scroll.
 npm install
 
 npm run triage                    # classify + act on unread inbox mail
-npm run triage -- --dry-run       # classify + persist, no JMAP actions
-npm run triage -- --haiku         # cheaper/faster model
+npm run triage -- --dry-run       # classify + report, no classifications or JMAP actions
 npm run triage -- --watch         # poll every 60s; SIGINT finishes the batch
 
 npm run act                       # attention-queue TUI (default 5 per batch)
@@ -106,24 +107,27 @@ Managed via [Doppler](https://doppler.com). `doppler login && doppler setup` onc
 machine.
 
 - `FASTMAIL_API_TOKEN` — Fastmail API token with mail read/write access
-- `ANTHROPIC_API_KEY` — Anthropic API key for classification
+- `OPENROUTER_API_KEY` — OpenRouter key for primary and backup models
+- `OPENROUTER_DAILY_BUDGET_USD` — optional daily cost ceiling; defaults to $1.00
 - `DATABASE_URL` — Postgres connection string
 - `UPTIME_KUMA_PUSH_URL` — optional heartbeat pinged after a successful triage run
 
 ## Database schema
 
-Postgres, a `tier` ENUM, and four tables. The authoritative DDL is
+Postgres, a `tier` ENUM, and six tables. The authoritative DDL is
 [`db/schema.sql`](db/schema.sql) — **update that file when you change the schema.**
 
 | Table | Purpose |
 |-------|---------|
 | `triage_runs` | One row per invocation. `completed_at IS NULL` marks a resumable run |
 | `classifications` | PK `(email_id, run_id)`. `acted_at` stamped only after JMAP succeeds |
-| `corrections` | Human overrides; fed back into the classifier prompt |
+| `corrections` | Human override audit trail |
 | `attention_actions` | `acted` / `snoozed` per attention email, with optional note and `snoozed_until` |
+| `sender_rules` | Exact normalized sender rules learned from corrections |
+| `model_calls` | Token, cache, cost, latency, and failure data for each model attempt |
 
-`corrections` and `attention_actions` are auto-created at runtime
-(`ensureCorrectionsTable`, `ensureAttentionActionsTable`). `triage_runs` and
+`corrections`, `attention_actions`, `sender_rules`, and `model_calls` are auto-created at runtime.
+`triage_runs` and
 `classifications` are not — a fresh database needs `db/schema.sql` first.
 
 The attention queue query takes the latest classification per `email_id`
@@ -164,7 +168,7 @@ The attention queue query takes the latest classification per `email_id`
 
 ## Testing
 
-Vitest, 67 unit tests across `jmap.test.ts`, `db.test.ts`, and `classifier.test.ts`. They
+Vitest tests across `jmap.test.ts`, `db.test.ts`, `routing.test.ts`, and `classifier.test.ts`. They
 mock `fetch` and the pg pool — **no network, no database, no API keys required**, so
 `npm test` is safe to run anywhere and should be run before every commit.
 
@@ -175,11 +179,14 @@ triage, and the running server for UI work.
 ## Key technical details
 
 - **Batch size**: 50 emails per JMAP fetch, 500ms pause between batches
-- **Models**: `claude-sonnet-4-6` default, `claude-haiku-4-5-20251001` via `--haiku`
-- **Max tokens**: 4096 per classification request
-- **Correction feedback**: the classifier loads recent corrections aggregated by sender
-  (up to 50, most recent per sender) and includes them as in-context examples. This is the
-  main learning loop — corrections recorded via `act`, `correct`, or the web UI all feed it
+- **Models**: `openai/gpt-5.6-luna` primary, `anthropic/claude-haiku-4.5` one-time backup
+- **Max tokens**: dynamic by model batch size, capped at 2500
+- **Correction feedback**: corrections recorded via `act`, `correct`, or the web UI upsert
+  an exact normalized sender rule. Future mail from that sender bypasses the model
+- **Deterministic routing**: explicit sender rules win; otherwise List-Unsubscribe mail
+  auto-archives without a model call
+- **Failure behavior**: both model failures abort the run without writing classifications;
+  mail remains unread and the failed heartbeat is sent
 - **Web UI**: Hono on port 3100, dark mobile UI, Attention tab default, Review lazy-loaded.
   **No authentication** — it is meant to sit behind Cloudflare Access, not be exposed
 - **DB connection**: SSL with `rejectUnauthorized: false`, pool `max: 3` (keeps the hourly

@@ -4,6 +4,7 @@ import {
   initDb,
   closeDb,
   ensureCorrectionsTable,
+  ensureOptimizationTables,
   getRecentClassifications,
   insertCorrection,
   ensureAttentionActionsTable,
@@ -1369,6 +1370,7 @@ async function start() {
   if (!process.env.DATABASE_URL) throw new Error("Missing DATABASE_URL");
   initDb();
   await ensureCorrectionsTable();
+  await ensureOptimizationTables();
   await ensureAttentionActionsTable();
 
   serve({ fetch: app.fetch, port: 3100 }, (info) => {

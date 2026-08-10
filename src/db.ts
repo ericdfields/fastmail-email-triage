@@ -1,5 +1,7 @@
 import pg from "pg";
 import type { Classification, Tier } from "./types.js";
+import type { ModelAttempt } from "./classifier.js";
+import { normalizeSender } from "./routing.js";
 
 const { Pool } = pg;
 
@@ -45,7 +47,10 @@ export async function findIncompleteRun(): Promise<{
     has_list_unsubscribe: boolean;
     acted_at: string | null;
   }>(
-    "SELECT email_id, subject, sender, received_at, tier, reason, has_list_unsubscribe, acted_at FROM classifications WHERE run_id = $1",
+    `SELECT email_id, subject, sender, received_at, tier, reason, has_list_unsubscribe, acted_at
+     FROM classifications
+     WHERE run_id = $1
+       AND reason <> 'Classification failed — defaulting to confirm'`,
     [runId]
   );
 
@@ -166,6 +171,117 @@ export async function ensureCorrectionsTable() {
   `);
 }
 
+/** Create token-efficiency tables and migrate existing corrections into exact-sender rules. */
+export async function ensureOptimizationTables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sender_rules (
+      sender      TEXT PRIMARY KEY,
+      tier        tier NOT NULL,
+      source      TEXT NOT NULL DEFAULT 'correction',
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS model_calls (
+      model_call_id     BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+      run_id            BIGINT NOT NULL REFERENCES triage_runs(run_id),
+      model             TEXT NOT NULL,
+      attempt           INTEGER NOT NULL,
+      status            TEXT NOT NULL CHECK (status IN ('success', 'failed')),
+      batch_size        INTEGER NOT NULL,
+      input_tokens      INTEGER NOT NULL DEFAULT 0,
+      output_tokens     INTEGER NOT NULL DEFAULT 0,
+      cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+      cost_usd          NUMERIC(12, 8) NOT NULL DEFAULT 0,
+      latency_ms        INTEGER NOT NULL,
+      error_type        TEXT,
+      created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS model_calls_created_at_idx
+    ON model_calls (created_at DESC)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS classifications_success_email_idx
+    ON classifications (email_id)
+    WHERE reason <> 'Classification failed — defaulting to confirm'
+  `);
+
+  await pool.query(`
+    INSERT INTO sender_rules (sender, tier, source, updated_at)
+    SELECT DISTINCT ON (lower(trim(c.sender)))
+           lower(trim(c.sender)), cr.corrected_tier, 'correction', cr.corrected_at
+    FROM corrections cr
+    JOIN classifications c ON cr.email_id = c.email_id AND cr.run_id = c.run_id
+    WHERE trim(c.sender) <> ''
+    ORDER BY lower(trim(c.sender)), cr.corrected_at DESC
+    ON CONFLICT (sender) DO NOTHING
+  `);
+}
+
+/** Return email IDs that already have a genuine (non-fallback) classification. */
+export async function getPreviouslyClassifiedEmailIds(emailIds: string[]): Promise<Set<string>> {
+  if (emailIds.length === 0) return new Set();
+  const result = await pool.query<{ email_id: string }>(
+    `SELECT DISTINCT email_id
+     FROM classifications
+     WHERE email_id = ANY($1::text[])
+       AND reason <> 'Classification failed — defaulting to confirm'`,
+    [emailIds]
+  );
+  return new Set(result.rows.map((row) => row.email_id));
+}
+
+/** Load deterministic rules for the exact normalized sender strings in a batch. */
+export async function getSenderRules(senders: string[]): Promise<Map<string, Tier>> {
+  const normalized = [...new Set(senders.map(normalizeSender).filter(Boolean))];
+  if (normalized.length === 0) return new Map();
+  const result = await pool.query<{ sender: string; tier: Tier }>(
+    "SELECT sender, tier FROM sender_rules WHERE sender = ANY($1::text[])",
+    [normalized]
+  );
+  return new Map(result.rows.map((row) => [normalizeSender(row.sender), row.tier]));
+}
+
+/** Persist one OpenRouter attempt for cost, reliability, and latency monitoring. */
+export async function recordModelCall(runId: number, call: ModelAttempt): Promise<void> {
+  await pool.query(
+    `INSERT INTO model_calls
+       (run_id, model, attempt, status, batch_size, input_tokens, output_tokens,
+        cache_read_tokens, cache_write_tokens, cost_usd, latency_ms, error_type)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+    [
+      runId,
+      call.model,
+      call.attempt,
+      call.success ? "success" : "failed",
+      call.batchSize,
+      call.usage.inputTokens,
+      call.usage.outputTokens,
+      call.usage.cacheReadTokens,
+      call.usage.cacheWriteTokens,
+      call.usage.costUsd,
+      call.latencyMs,
+      call.errorType ?? null,
+    ]
+  );
+}
+
+export async function getTodayModelSpend(): Promise<number> {
+  const result = await pool.query<{ cost: string }>(
+    `SELECT COALESCE(SUM(cost_usd), 0)::text AS cost
+     FROM model_calls
+     WHERE created_at >= date_trunc('day', now())`
+  );
+  return Number(result.rows[0]?.cost ?? 0);
+}
+
 /** Get recent classifications for review. */
 export async function getRecentClassifications(limit: number = 20) {
   const result = await pool.query<{
@@ -229,6 +345,17 @@ export async function insertCorrection(
     [emailId, row.run_id, row.tier, correctedTier]
   );
 
+  const sender = normalizeSender(row.sender);
+  if (sender) {
+    await pool.query(
+      `INSERT INTO sender_rules (sender, tier, source, updated_at)
+       VALUES ($1, $2, 'correction', now())
+       ON CONFLICT (sender) DO UPDATE
+       SET tier = EXCLUDED.tier, source = EXCLUDED.source, updated_at = now()`,
+      [sender, correctedTier]
+    );
+  }
+
   return { originalTier: row.tier, runId: row.run_id, subject: row.subject, from: row.sender };
 }
 
@@ -275,34 +402,6 @@ export async function getAccuracyStats() {
       count: parseInt(r.count),
     })),
   };
-}
-
-/** Get recent corrections aggregated by sender (most recent per unique sender, capped at 50). */
-export async function getRecentCorrections(limit: number = 50) {
-  const result = await pool.query<{
-    sender: string;
-    subject: string;
-    has_list_unsubscribe: boolean;
-    original_tier: Tier;
-    corrected_tier: Tier;
-  }>(
-    `SELECT DISTINCT ON (c.sender)
-            c.sender, c.subject, c.has_list_unsubscribe,
-            cr.original_tier, cr.corrected_tier
-     FROM corrections cr
-     JOIN classifications c ON cr.email_id = c.email_id AND cr.run_id = c.run_id
-     ORDER BY c.sender, cr.corrected_at DESC
-     LIMIT $1`,
-    [limit]
-  );
-
-  return result.rows.map((r) => ({
-    sender: r.sender,
-    subject: r.subject,
-    hasListUnsubscribe: r.has_list_unsubscribe,
-    originalTier: r.original_tier,
-    correctedTier: r.corrected_tier,
-  }));
 }
 
 // --- Attention Actions ---
