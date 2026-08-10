@@ -225,6 +225,157 @@ export async function ensureOptimizationTables() {
   `);
 }
 
+export type UnsubscribeCandidateRow = {
+  sender: string;
+  emailId: string;
+  messageCount: number;
+  latestSubject: string;
+  recentSubjects: string[];
+  lastReceivedAt: string;
+};
+
+/** Create the audit table used by the human-authorized unsubscribe workflow. */
+export async function ensureUnsubscribeActionsTable(): Promise<void> {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS unsubscribe_actions (
+      action_id      BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+      sender         TEXT NOT NULL,
+      email_id       TEXT NOT NULL,
+      action         TEXT NOT NULL CHECK (action IN ('one-click', 'keep')),
+      method         TEXT NOT NULL,
+      target_host    TEXT,
+      status         TEXT NOT NULL CHECK (status IN ('pending', 'success', 'failed')),
+      http_status    INTEGER,
+      error          TEXT,
+      created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+      completed_at   TIMESTAMPTZ
+    )
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS unsubscribe_actions_sender_idx
+    ON unsubscribe_actions (sender, created_at DESC)
+  `);
+
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS unsubscribe_actions_active_sender_idx
+    ON unsubscribe_actions (sender)
+    WHERE status IN ('pending', 'success')
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS classifications_unsubscribe_sender_idx
+    ON classifications (sender, received_at DESC)
+    WHERE has_list_unsubscribe = true
+  `);
+}
+
+/** Group recent List-Unsubscribe mail by exact normalized sender for human review. */
+export async function getUnsubscribeCandidates(
+  days: number = 90,
+  minimumMessages: number = 2,
+  limit: number = 100
+): Promise<UnsubscribeCandidateRow[]> {
+  const result = await pool.query<{
+    sender: string;
+    email_id: string;
+    message_count: string;
+    latest_subject: string;
+    recent_subjects: string[];
+    last_received_at: string;
+  }>(
+    `WITH latest AS (
+       SELECT DISTINCT ON (email_id)
+         email_id, lower(trim(sender)) AS sender, subject, received_at, classified_at
+       FROM classifications
+       WHERE has_list_unsubscribe = true
+         AND received_at >= now() - make_interval(days => $1)
+         AND reason <> 'Classification failed — defaulting to confirm'
+       ORDER BY email_id, classified_at DESC
+     ), grouped AS (
+       SELECT sender,
+              (array_agg(email_id ORDER BY received_at DESC))[1] AS email_id,
+              COUNT(*)::text AS message_count,
+              (array_agg(subject ORDER BY received_at DESC))[1] AS latest_subject,
+              (array_agg(subject ORDER BY received_at DESC))[1:3] AS recent_subjects,
+              MAX(received_at) AS last_received_at
+       FROM latest
+       WHERE sender <> ''
+       GROUP BY sender
+       HAVING COUNT(*) >= $2
+     )
+     SELECT g.*
+     FROM grouped g
+     WHERE NOT EXISTS (
+       SELECT 1 FROM unsubscribe_actions ua
+       WHERE ua.sender = g.sender
+         AND (
+           ua.status = 'success'
+           OR (ua.status = 'pending' AND ua.created_at >= now() - interval '15 minutes')
+         )
+     )
+     ORDER BY g.message_count::bigint DESC, g.last_received_at DESC
+     LIMIT $3`,
+    [days, minimumMessages, limit]
+  );
+
+  return result.rows.map((row) => ({
+    sender: row.sender,
+    emailId: row.email_id,
+    messageCount: parseInt(row.message_count),
+    latestSubject: row.latest_subject,
+    recentSubjects: row.recent_subjects,
+    lastReceivedAt:
+      typeof row.last_received_at === "string"
+        ? row.last_received_at
+        : new Date(row.last_received_at).toISOString(),
+  }));
+}
+
+export async function startUnsubscribeAction(
+  sender: string,
+  emailId: string,
+  action: "one-click" | "keep",
+  method: string,
+  targetHost?: string
+): Promise<number | null> {
+  const result = await pool.query<{ action_id: number }>(
+    `WITH expired AS (
+       UPDATE unsubscribe_actions
+       SET status = 'failed', error = 'Previous attempt interrupted', completed_at = now()
+       WHERE sender = $1
+         AND status = 'pending'
+         AND created_at < now() - interval '15 minutes'
+     )
+     INSERT INTO unsubscribe_actions
+       (sender, email_id, action, method, target_host, status)
+     VALUES ($1, $2, $3, $4, $5, 'pending')
+     ON CONFLICT DO NOTHING
+     RETURNING action_id`,
+    [normalizeSender(sender), emailId, action, method, targetHost ?? null]
+  );
+  return result.rows[0]?.action_id ?? null;
+}
+
+export async function finishUnsubscribeAction(
+  actionId: number,
+  status: "success" | "failed",
+  httpStatus?: number,
+  error?: string
+): Promise<void> {
+  await pool.query(
+    `UPDATE unsubscribe_actions
+     SET status = $2, http_status = $3, error = $4, completed_at = now()
+     WHERE action_id = $1`,
+    [actionId, status, httpStatus ?? null, error?.slice(0, 500) ?? null]
+  );
+}
+
+export async function keepUnsubscribeSender(sender: string, emailId: string): Promise<void> {
+  const actionId = await startUnsubscribeAction(sender, emailId, "keep", "human-review");
+  if (actionId !== null) await finishUnsubscribeAction(actionId, "success");
+}
+
 /** Return email IDs that already have a genuine (non-fallback) classification. */
 export async function getPreviouslyClassifiedEmailIds(emailIds: string[]): Promise<Set<string>> {
   if (emailIds.length === 0) return new Set();

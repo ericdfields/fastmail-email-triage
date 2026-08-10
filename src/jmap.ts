@@ -1,4 +1,11 @@
-import type { ActionResult, Classification, EmailSummary, JMAPSession, MailboxIds } from "./types.js";
+import type {
+  ActionResult,
+  Classification,
+  EmailSummary,
+  JMAPSession,
+  MailboxIds,
+  UnsubscribeHeaders,
+} from "./types.js";
 
 const BATCH_SIZE = 50;
 
@@ -307,6 +314,48 @@ export async function fetchEmailBodies(
     result.set(email.id, text.length > 500 ? text.substring(0, 497) + "..." : text);
   }
 
+  return result;
+}
+
+/** Fetch unsubscribe headers immediately before a human-approved action. */
+export async function fetchUnsubscribeHeaders(
+  session: JMAPSession,
+  emailIds: string[]
+): Promise<Map<string, UnsubscribeHeaders>> {
+  if (emailIds.length === 0) return new Map();
+
+  const data = await jmapRequest(session, {
+    using: ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+    methodCalls: [
+      [
+        "Email/get",
+        {
+          accountId: session.accountId,
+          ids: emailIds,
+          properties: [
+            "id",
+            "header:List-Unsubscribe:asURLs",
+            "header:List-Unsubscribe-Post:asText",
+            "header:Authentication-Results:asText:all",
+            "header:DKIM-Signature:asText:all",
+          ],
+        },
+        "unsubscribe0",
+      ],
+    ],
+  });
+
+  const result = new Map<string, UnsubscribeHeaders>();
+  const emails: any[] = data.methodResponses[0][1].list ?? [];
+  for (const email of emails) {
+    result.set(email.id, {
+      emailId: email.id,
+      urls: email["header:List-Unsubscribe:asURLs"] ?? null,
+      listUnsubscribePost: email["header:List-Unsubscribe-Post:asText"] ?? null,
+      authenticationResults: email["header:Authentication-Results:asText:all"] ?? [],
+      dkimSignatures: email["header:DKIM-Signature:asText:all"] ?? [],
+    });
+  }
   return result;
 }
 

@@ -1,5 +1,6 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
+import { pathToFileURL } from "node:url";
 import {
   initDb,
   closeDb,
@@ -11,6 +12,11 @@ import {
   getAttentionQueue,
   getAttentionQueueCount,
   recordAttentionAction,
+  ensureUnsubscribeActionsTable,
+  getUnsubscribeCandidates,
+  startUnsubscribeAction,
+  finishUnsubscribeAction,
+  keepUnsubscribeSender,
 } from "./db.js";
 import {
   getSession,
@@ -18,11 +24,17 @@ import {
   fetchEmailBodies,
   archiveEmail,
   applyTierAction,
+  fetchUnsubscribeHeaders,
 } from "./jmap.js";
+import {
+  hasAuthenticatedOneClick,
+  selectOneClickUrl,
+  unsubscribeOneClick,
+} from "./unsubscribe.js";
 import type { Tier, JMAPSession, MailboxIds } from "./types.js";
 
 const TIERS: Tier[] = ["auto-delete", "auto-archive", "confirm", "attention"];
-const app = new Hono();
+export const app = new Hono();
 
 let jmapSession: JMAPSession | null = null;
 let jmapMailboxIds: MailboxIds | null = null;
@@ -129,6 +141,216 @@ app.post("/api/attention/reclassify", async (c) => {
   await applyTierAction(jmap.session, jmap.mailboxIds, emailId, tier);
   await recordAttentionAction(emailId, runId, "acted");
 
+  return c.json({ success: true });
+});
+
+const UNSUBSCRIBE_REVIEW_DAYS = 90;
+const UNSUBSCRIBE_MINIMUM_MESSAGES = 2;
+const UNSUBSCRIBE_LIMIT = 200;
+const UNSUBSCRIBE_BATCH_LIMIT = 25;
+
+async function currentUnsubscribeCandidates() {
+  return getUnsubscribeCandidates(
+    UNSUBSCRIBE_REVIEW_DAYS,
+    UNSUBSCRIBE_MINIMUM_MESSAGES,
+    UNSUBSCRIBE_LIMIT
+  );
+}
+
+function describeUnsubscribeMethod(
+  urls: string[] | null,
+  listUnsubscribePost: string | null,
+  authenticated: boolean
+): { eligible: boolean; method: string; targetHost: string | null } {
+  const oneClickUrl = selectOneClickUrl(urls, listUnsubscribePost);
+  if (oneClickUrl && authenticated) {
+    return {
+      eligible: true,
+      method: "one-click",
+      targetHost: new URL(oneClickUrl).hostname.toLowerCase(),
+    };
+  }
+
+  if (oneClickUrl) {
+    return {
+      eligible: false,
+      method: "unverified",
+      targetHost: new URL(oneClickUrl).hostname.toLowerCase(),
+    };
+  }
+
+  for (const rawUrl of urls ?? []) {
+    try {
+      const url = new URL(rawUrl);
+      if (url.protocol === "https:") {
+        return { eligible: false, method: "web-manual", targetHost: url.hostname.toLowerCase() };
+      }
+      if (url.protocol === "mailto:") {
+        return { eligible: false, method: "email-manual", targetHost: null };
+      }
+    } catch {
+      // Ignore malformed header alternatives.
+    }
+  }
+
+  return { eligible: false, method: "unavailable", targetHost: null };
+}
+
+// API: List recurring unsubscribe candidates; URLs and embedded tokens never leave the server.
+app.get("/api/unsubscribe/candidates", async (c) => {
+  const candidates = await currentUnsubscribeCandidates();
+  if (candidates.length === 0) return c.json([]);
+
+  const jmap = await getJmap();
+  const headers = await fetchUnsubscribeHeaders(
+    jmap.session,
+    candidates.map((candidate) => candidate.emailId)
+  );
+
+  return c.json(
+    candidates.map((candidate) => {
+      const header = headers.get(candidate.emailId);
+      const method = header
+        ? describeUnsubscribeMethod(
+            header.urls,
+            header.listUnsubscribePost,
+            hasAuthenticatedOneClick(header.authenticationResults, header.dkimSignatures)
+          )
+        : { eligible: false, method: "unavailable", targetHost: null };
+      return { ...candidate, ...method };
+    })
+  );
+});
+
+app.get("/api/unsubscribe/count", async (c) => {
+  const candidates = await currentUnsubscribeCandidates();
+  return c.json({ count: candidates.length });
+});
+
+type UnsubscribeApproval = { sender: string; emailId: string };
+
+function parseUnsubscribeApprovals(body: unknown): UnsubscribeApproval[] | null {
+  if (!body || typeof body !== "object" || !("items" in body)) return null;
+  const items = (body as { items?: unknown }).items;
+  if (!Array.isArray(items) || items.length === 0 || items.length > UNSUBSCRIBE_BATCH_LIMIT) {
+    return null;
+  }
+  if (
+    items.some(
+      (item) =>
+        !item ||
+        typeof item !== "object" ||
+        typeof (item as UnsubscribeApproval).sender !== "string" ||
+        typeof (item as UnsubscribeApproval).emailId !== "string"
+    )
+  ) {
+    return null;
+  }
+  return items as UnsubscribeApproval[];
+}
+
+// API: Execute an explicitly approved batch of RFC 8058 one-click requests.
+app.post("/api/unsubscribe/process", async (c) => {
+  const approvals = parseUnsubscribeApprovals(await c.req.json());
+  if (!approvals) return c.json({ error: "Select between 1 and 25 valid candidates" }, 400);
+
+  const current = await currentUnsubscribeCandidates();
+  const allowed = new Map(
+    current.map((candidate) => [`${candidate.sender}\n${candidate.emailId}`, candidate])
+  );
+  const approved = approvals
+    .map((item) => allowed.get(`${item.sender.trim().toLowerCase()}\n${item.emailId}`))
+    .filter((item) => item !== undefined);
+  if (approved.length !== approvals.length) {
+    return c.json({ error: "One or more candidates are stale or invalid; refresh and try again" }, 409);
+  }
+
+  const jmap = await getJmap();
+  const headers = await fetchUnsubscribeHeaders(
+    jmap.session,
+    approved.map((candidate) => candidate.emailId)
+  );
+  const results: Array<{
+    sender: string;
+    emailId: string;
+    success: boolean;
+    httpStatus?: number;
+    error?: string;
+  }> = [];
+
+  const processCandidate = async (candidate: (typeof approved)[number]): Promise<void> => {
+    const header = headers.get(candidate.emailId);
+    const authenticated = header
+      ? hasAuthenticatedOneClick(header.authenticationResults, header.dkimSignatures)
+      : false;
+    const oneClickUrl = header && authenticated
+      ? selectOneClickUrl(header.urls, header.listUnsubscribePost)
+      : null;
+    const targetHost = oneClickUrl ? new URL(oneClickUrl).hostname.toLowerCase() : undefined;
+    const actionId = await startUnsubscribeAction(
+      candidate.sender,
+      candidate.emailId,
+      "one-click",
+      "rfc8058",
+      targetHost
+    );
+
+    if (actionId === null) {
+      results.push({
+        sender: candidate.sender,
+        emailId: candidate.emailId,
+        success: false,
+        error: "Already processed",
+      });
+      return;
+    }
+
+    if (!oneClickUrl) {
+      const error = "No current RFC 8058 one-click HTTPS endpoint";
+      await finishUnsubscribeAction(actionId, "failed", undefined, error);
+      results.push({ sender: candidate.sender, emailId: candidate.emailId, success: false, error });
+      return;
+    }
+
+    try {
+      const result = await unsubscribeOneClick(oneClickUrl);
+      await finishUnsubscribeAction(actionId, "success", result.httpStatus);
+      results.push({
+        sender: candidate.sender,
+        emailId: candidate.emailId,
+        success: true,
+        httpStatus: result.httpStatus,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unsubscribe request failed";
+      await finishUnsubscribeAction(actionId, "failed", undefined, message);
+      results.push({ sender: candidate.sender, emailId: candidate.emailId, success: false, error: message });
+    }
+  };
+
+  // Bounded batches finish within the proxy request window without flooding provider endpoints.
+  for (let index = 0; index < approved.length; index += 5) {
+    await Promise.all(approved.slice(index, index + 5).map(processCandidate));
+  }
+
+  return c.json({ results });
+});
+
+// API: Remember an explicit choice to keep a sender and stop suggesting it.
+app.post("/api/unsubscribe/keep", async (c) => {
+  const approvals = parseUnsubscribeApprovals(await c.req.json());
+  if (!approvals || approvals.length !== 1) {
+    return c.json({ error: "Choose exactly one sender to keep" }, 400);
+  }
+
+  const [approval] = approvals;
+  const current = await currentUnsubscribeCandidates();
+  const candidate = current.find(
+    (item) => item.sender === approval!.sender.trim().toLowerCase() && item.emailId === approval!.emailId
+  );
+  if (!candidate) return c.json({ error: "Candidate is stale or invalid" }, 409);
+
+  await keepUnsubscribeSender(candidate.sender, candidate.emailId);
   return c.json({ success: true });
 });
 
@@ -802,6 +1024,198 @@ app.get("/", (c) => {
   }
 
   .note-toggle:hover, .note-toggle.active { opacity: 1; }
+
+  /* Unsubscribe review */
+  .unsub-intro {
+    padding: 18px 16px 14px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .unsub-intro h2 {
+    font-size: 1.05rem;
+    letter-spacing: -0.02em;
+    line-height: 1.25;
+  }
+
+  .unsub-intro p {
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    line-height: 1.5;
+    margin-top: 5px;
+    max-width: 70ch;
+  }
+
+  .unsub-toolbar {
+    position: sticky;
+    top: 63px;
+    z-index: 50;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 58px;
+    padding: 8px 10px;
+    background: rgba(10, 10, 15, 0.94);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .unsub-select-all,
+  .unsub-process,
+  .unsub-keep {
+    appearance: none;
+    font-family: var(--font);
+    font-weight: 650;
+    cursor: pointer;
+    transition: background 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
+  }
+
+  .unsub-select-all {
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text-muted);
+    border-radius: var(--radius-sm);
+    padding: 0 12px;
+    min-height: 42px;
+    font-size: 0.76rem;
+  }
+
+  .unsub-process {
+    border: 1px solid rgba(6, 182, 212, 0.42);
+    background: rgba(6, 182, 212, 0.12);
+    color: #67e8f9;
+    border-radius: var(--radius-sm);
+    padding: 0 15px;
+    min-height: 42px;
+    font-size: 0.78rem;
+    margin-left: auto;
+  }
+
+  .unsub-process.confirming {
+    background: #0891b2;
+    border-color: #22d3ee;
+    color: #041619;
+  }
+
+  .unsub-process:disabled,
+  .unsub-select-all:disabled,
+  .unsub-keep:disabled {
+    opacity: 0.38;
+    cursor: default;
+  }
+
+  .unsub-process:not(:disabled):active,
+  .unsub-select-all:not(:disabled):active,
+  .unsub-keep:not(:disabled):active { transform: scale(0.96); }
+
+  .unsub-list {
+    margin: 8px 10px 24px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+
+  .unsub-row {
+    display: grid;
+    grid-template-columns: 28px minmax(0, 1fr) auto;
+    gap: 10px;
+    align-items: start;
+    padding: 14px 12px;
+    border-bottom: 1px solid var(--border);
+    animation: fadeUp 0.3s ease both;
+  }
+
+  .unsub-row:last-child { border-bottom: 0; }
+  .unsub-row.manual { opacity: 0.68; }
+  .unsub-row.failed { background: rgba(239, 68, 68, 0.06); }
+
+  .unsub-check {
+    appearance: none;
+    width: 22px;
+    height: 22px;
+    border: 1px solid var(--border-hover);
+    border-radius: 5px;
+    background: var(--bg);
+    margin-top: 1px;
+    cursor: pointer;
+    display: grid;
+    place-content: center;
+  }
+
+  .unsub-check::after {
+    content: "";
+    width: 10px;
+    height: 6px;
+    border-left: 2px solid #041619;
+    border-bottom: 2px solid #041619;
+    transform: rotate(-45deg) translateY(-1px) scale(0);
+    transition: transform 0.12s ease;
+  }
+
+  .unsub-check:checked {
+    background: #22d3ee;
+    border-color: #22d3ee;
+  }
+
+  .unsub-check:checked::after { transform: rotate(-45deg) translateY(-1px) scale(1); }
+  .unsub-check:disabled { opacity: 0.28; cursor: default; }
+
+  .unsub-sender {
+    font-size: 0.9rem;
+    font-weight: 650;
+    color: var(--text);
+    overflow-wrap: anywhere;
+  }
+
+  .unsub-subject {
+    margin-top: 3px;
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .unsub-meta {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    flex-wrap: wrap;
+    margin-top: 8px;
+    color: var(--text-dim);
+    font-size: 0.72rem;
+  }
+
+  .unsub-method {
+    padding: 3px 7px;
+    border-radius: 4px;
+    background: rgba(6, 182, 212, 0.1);
+    color: #67e8f9;
+    font-size: 0.67rem;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+  }
+
+  .manual .unsub-method { background: rgba(110, 110, 130, 0.12); color: var(--text-muted); }
+  .unsub-error { color: var(--tier-delete); }
+
+  .unsub-keep {
+    border: 0;
+    background: transparent;
+    color: var(--text-muted);
+    min-height: 32px;
+    padding: 0 6px;
+    font-size: 0.72rem;
+  }
+
+  @media (min-width: 760px) {
+    #app { max-width: 820px; margin: 0 auto; }
+    .header { border-left: 1px solid var(--border); border-right: 1px solid var(--border); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+  }
 </style>
 </head>
 <body>
@@ -819,6 +1233,7 @@ app.get("/", (c) => {
   <div class="tabs">
     <button class="tab active" data-tab="attention">Attention <span class="tab-badge" id="attnBadge"></span></button>
     <button class="tab" data-tab="review">Review</button>
+    <button class="tab" data-tab="unsubscribe">Unsubscribe <span class="tab-badge" id="unsubBadge"></span></button>
   </div>
   <div class="view" id="reviewView">
     <div class="list" id="list"></div>
@@ -833,6 +1248,18 @@ app.get("/", (c) => {
       <button class="btn-load-more" id="attnLoadMoreBtn">Load more</button>
     </div>
     <div class="empty" id="attnEmpty" style="display:none">No attention emails pending.</div>
+  </div>
+  <div class="view" id="unsubscribeView">
+    <section class="unsub-intro">
+      <h2>Quiet recurring senders</h2>
+      <p>Recurring mail from the last 90 days. Only verified one-click senders can be selected; every request needs your approval.</p>
+    </section>
+    <div class="unsub-toolbar" id="unsubToolbar">
+      <button class="unsub-select-all" id="unsubSelectAll" disabled>Select eligible</button>
+      <button class="unsub-process" id="unsubProcess" disabled>Choose senders</button>
+    </div>
+    <div class="unsub-list" id="unsubList"></div>
+    <div class="empty" id="unsubEmpty" style="display:none">No recurring senders to review.</div>
   </div>
 </div>
 
@@ -855,6 +1282,13 @@ app.get("/", (c) => {
   let activeTab = 'attention';
   let reviewLoaded = false;
 
+  // Unsubscribe review state
+  let unsubItems = [];
+  let unsubLoading = false;
+  let unsubscribeLoaded = false;
+  let selectedUnsub = new Set();
+  let unsubConfirmTimer = null;
+
   const listEl = document.getElementById('list');
   const emptyEl = document.getElementById('empty');
   const countEl = document.getElementById('count');
@@ -871,6 +1305,12 @@ app.get("/", (c) => {
   const attnLoadMoreWrap = document.getElementById('attnLoadMoreWrap');
   const reviewView = document.getElementById('reviewView');
   const attentionView = document.getElementById('attentionView');
+  const unsubscribeView = document.getElementById('unsubscribeView');
+  const unsubListEl = document.getElementById('unsubList');
+  const unsubEmptyEl = document.getElementById('unsubEmpty');
+  const unsubBadgeEl = document.getElementById('unsubBadge');
+  const unsubSelectAllBtn = document.getElementById('unsubSelectAll');
+  const unsubProcessBtn = document.getElementById('unsubProcess');
 
   function showToast(msg, isError) {
     toastEl.textContent = msg;
@@ -1060,6 +1500,8 @@ app.get("/", (c) => {
   refreshBtn.addEventListener('click', function() {
     if (activeTab === 'review') {
       loadClassifications(true);
+    } else if (activeTab === 'unsubscribe') {
+      loadUnsubscribe();
     } else {
       loadAttention(true);
     }
@@ -1075,12 +1517,17 @@ app.get("/", (c) => {
       document.querySelectorAll('.tab').forEach(function(t) { t.classList.toggle('active', t.getAttribute('data-tab') === target); });
       reviewView.classList.toggle('active', target === 'review');
       attentionView.classList.toggle('active', target === 'attention');
+      unsubscribeView.classList.toggle('active', target === 'unsubscribe');
       if (target === 'attention' && attnItems.length === 0) {
         loadAttention(true);
       }
       if (target === 'review' && !reviewLoaded) {
         reviewLoaded = true;
         loadClassifications(true);
+      }
+      if (target === 'unsubscribe' && !unsubscribeLoaded) {
+        unsubscribeLoaded = true;
+        loadUnsubscribe();
       }
     });
   });
@@ -1353,11 +1800,212 @@ app.get("/", (c) => {
     }
   });
 
+  // --- Unsubscribe Review ---
+  function unsubscribeMethodLabel(item) {
+    if (item.method === 'one-click') return 'One-click';
+    if (item.method === 'web-manual') return 'Manual web';
+    if (item.method === 'email-manual') return 'Manual email';
+    if (item.method === 'unverified') return 'Unverified';
+    return 'Unavailable';
+  }
+
+  function renderUnsubItem(item, index) {
+    var selected = selectedUnsub.has(item.emailId);
+    var selectable = item.eligible && (selected || selectedUnsub.size < 25);
+    var rowClass = 'unsub-row' + (item.eligible ? '' : ' manual') + (item.error ? ' failed' : '');
+    var delay = Math.min(index * 0.025, 0.35);
+    var activity = item.messageCount + ' message' + (item.messageCount === 1 ? '' : 's') + ' · latest ' + timeAgo(item.lastReceivedAt);
+    var target = item.targetHost ? ' · ' + escHtml(item.targetHost) : '';
+    var error = item.error ? '<span class="unsub-error">' + escHtml(item.error) + '</span>' : '';
+
+    return '<div class="' + rowClass + '" data-index="' + index + '" style="animation-delay:' + delay + 's">'
+      + '<input class="unsub-check" type="checkbox" aria-label="Select ' + escHtml(item.sender) + '"'
+      + (selected ? ' checked' : '') + (selectable ? '' : ' disabled') + '>'
+      + '<div class="unsub-content">'
+      +   '<div class="unsub-sender">' + escHtml(item.sender) + '</div>'
+      +   '<div class="unsub-subject">' + escHtml(item.latestSubject) + '</div>'
+      +   '<div class="unsub-meta"><span class="unsub-method">' + unsubscribeMethodLabel(item) + '</span>'
+      +     '<span>' + activity + target + '</span>' + error + '</div>'
+      + '</div>'
+      + '<button class="unsub-keep" data-action="keep" aria-label="Keep mail from ' + escHtml(item.sender) + '">Keep</button>'
+      + '</div>';
+  }
+
+  function resetUnsubConfirmation() {
+    clearTimeout(unsubConfirmTimer);
+    unsubConfirmTimer = null;
+    unsubProcessBtn.classList.remove('confirming');
+  }
+
+  function updateUnsubToolbar() {
+    resetUnsubConfirmation();
+    var eligible = unsubItems.filter(function(item) { return item.eligible; });
+    var selectable = eligible.slice(0, 25);
+    var selectedCount = selectedUnsub.size;
+    var allSelected = selectable.length > 0 && selectable.every(function(item) { return selectedUnsub.has(item.emailId); });
+
+    unsubSelectAllBtn.disabled = unsubLoading || eligible.length === 0;
+    unsubSelectAllBtn.textContent = allSelected ? 'Clear selection' : 'Select eligible';
+    unsubProcessBtn.disabled = unsubLoading || selectedCount === 0;
+    unsubProcessBtn.textContent = selectedCount === 0
+      ? 'Choose senders'
+      : 'Unsubscribe ' + selectedCount;
+  }
+
+  function renderUnsubscribe() {
+    unsubBadgeEl.textContent = unsubItems.length > 0 ? unsubItems.length : '';
+    if (unsubItems.length === 0) {
+      unsubListEl.innerHTML = '';
+      unsubListEl.style.display = 'none';
+      unsubEmptyEl.style.display = '';
+    } else {
+      unsubEmptyEl.style.display = 'none';
+      unsubListEl.style.display = '';
+      unsubListEl.innerHTML = unsubItems.map(renderUnsubItem).join('');
+    }
+    updateUnsubToolbar();
+  }
+
+  async function loadUnsubscribeCount() {
+    try {
+      var res = await fetch('/api/unsubscribe/count');
+      if (!res.ok) return;
+      var data = await res.json();
+      unsubBadgeEl.textContent = data.count > 0 ? data.count : '';
+    } catch (e) { /* silent */ }
+  }
+
+  async function loadUnsubscribe() {
+    if (unsubLoading) return;
+    unsubLoading = true;
+    selectedUnsub.clear();
+    refreshBtn.classList.add('loading');
+    updateUnsubToolbar();
+
+    try {
+      var res = await fetch('/api/unsubscribe/candidates');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      unsubItems = await res.json();
+      renderUnsubscribe();
+    } catch (e) {
+      showToast('Failed to load unsubscribe review: ' + e.message, true);
+    } finally {
+      unsubLoading = false;
+      refreshBtn.classList.remove('loading');
+      updateUnsubToolbar();
+    }
+  }
+
+  unsubListEl.addEventListener('change', function(e) {
+    var checkbox = e.target.closest('.unsub-check');
+    if (!checkbox) return;
+    var row = checkbox.closest('.unsub-row');
+    var item = unsubItems[parseInt(row.getAttribute('data-index'))];
+    if (!item || !item.eligible) return;
+    if (checkbox.checked) selectedUnsub.add(item.emailId);
+    else selectedUnsub.delete(item.emailId);
+    renderUnsubscribe();
+  });
+
+  unsubSelectAllBtn.addEventListener('click', function() {
+    var eligible = unsubItems.filter(function(item) { return item.eligible; });
+    var selectable = eligible.slice(0, 25);
+    var allSelected = selectable.length > 0 && selectable.every(function(item) { return selectedUnsub.has(item.emailId); });
+    selectedUnsub.clear();
+    if (!allSelected) selectable.forEach(function(item) { selectedUnsub.add(item.emailId); });
+    renderUnsubscribe();
+  });
+
+  async function processSelectedUnsubscribes() {
+    var selectedItems = unsubItems.filter(function(item) { return selectedUnsub.has(item.emailId); });
+    if (selectedItems.length === 0) return;
+    unsubLoading = true;
+    updateUnsubToolbar();
+
+    try {
+      var res = await fetch('/api/unsubscribe/process', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          items: selectedItems.map(function(item) { return { sender: item.sender, emailId: item.emailId }; }),
+        }),
+      });
+      if (!res.ok) {
+        var failure = await res.json().catch(function() { return {}; });
+        throw new Error(failure.error || 'HTTP ' + res.status);
+      }
+
+      var data = await res.json();
+      var resultByEmail = new Map(data.results.map(function(result) { return [result.emailId, result]; }));
+      var succeeded = 0;
+      unsubItems = unsubItems.filter(function(item) {
+        var result = resultByEmail.get(item.emailId);
+        if (!result) return true;
+        if (result.success) {
+          succeeded++;
+          return false;
+        }
+        item.error = result.error || 'Request failed';
+        return true;
+      });
+      selectedUnsub.clear();
+      renderUnsubscribe();
+      var failed = data.results.length - succeeded;
+      showToast(
+        succeeded + ' unsubscribed' + (failed ? ', ' + failed + ' need review' : ''),
+        failed > 0
+      );
+    } catch (e) {
+      showToast('Bulk unsubscribe failed: ' + e.message, true);
+    } finally {
+      unsubLoading = false;
+      updateUnsubToolbar();
+    }
+  }
+
+  unsubProcessBtn.addEventListener('click', function() {
+    if (!unsubProcessBtn.classList.contains('confirming')) {
+      var count = selectedUnsub.size;
+      unsubProcessBtn.classList.add('confirming');
+      unsubProcessBtn.textContent = 'Confirm ' + count + ' unsubscribe' + (count === 1 ? '' : 's');
+      unsubConfirmTimer = setTimeout(updateUnsubToolbar, 5000);
+      return;
+    }
+    resetUnsubConfirmation();
+    processSelectedUnsubscribes();
+  });
+
+  unsubListEl.addEventListener('click', async function(e) {
+    var keepBtn = e.target.closest('[data-action="keep"]');
+    if (!keepBtn) return;
+    var row = keepBtn.closest('.unsub-row');
+    var item = unsubItems[parseInt(row.getAttribute('data-index'))];
+    if (!item) return;
+    keepBtn.disabled = true;
+
+    try {
+      var res = await fetch('/api/unsubscribe/keep', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ items: [{ sender: item.sender, emailId: item.emailId }] }),
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      selectedUnsub.delete(item.emailId);
+      unsubItems.splice(parseInt(row.getAttribute('data-index')), 1);
+      renderUnsubscribe();
+      showToast('Keeping ' + item.sender, false);
+    } catch (e) {
+      keepBtn.disabled = false;
+      showToast('Could not save choice', true);
+    }
+  });
+
   attnLoadMoreBtn.addEventListener('click', function() { loadAttention(false); });
 
   // Initial load
   loadAttention(true);
   loadAttentionCount();
+  loadUnsubscribeCount();
 })();
 </script>
 
@@ -1372,6 +2020,7 @@ async function start() {
   await ensureCorrectionsTable();
   await ensureOptimizationTables();
   await ensureAttentionActionsTable();
+  await ensureUnsubscribeActionsTable();
 
   serve({ fetch: app.fetch, port: 3100 }, (info) => {
     console.log(`Email Triage server running on http://localhost:${info.port}`);
@@ -1384,7 +2033,9 @@ async function start() {
   });
 }
 
-start().catch((err) => {
-  console.error("Server failed to start:", err);
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  start().catch((err) => {
+    console.error("Server failed to start:", err);
+    process.exit(1);
+  });
+}
