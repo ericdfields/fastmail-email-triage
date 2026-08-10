@@ -28,6 +28,11 @@ import {
   getAttentionQueue,
   getAttentionQueueCount,
   recordAttentionAction,
+  ensureUnsubscribeActionsTable,
+  getUnsubscribeCandidates,
+  startUnsubscribeAction,
+  finishUnsubscribeAction,
+  keepUnsubscribeSender,
 } from "./db.js";
 import type { Classification } from "./types.js";
 
@@ -510,5 +515,111 @@ describe("recordAttentionAction", () => {
 
     const [sql] = mockQuery.mock.calls[0] as [string];
     expect(sql).toContain("ON CONFLICT DO NOTHING");
+  });
+});
+
+describe("unsubscribe review persistence", () => {
+  it("creates the audit table and active-sender safety index", async () => {
+    mockQuery.mockResolvedValue({ rows: [] });
+
+    await ensureUnsubscribeActionsTable();
+
+    const sql = mockQuery.mock.calls.map((call) => call[0]).join("\n");
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS unsubscribe_actions");
+    expect(sql).toContain("unsubscribe_actions_active_sender_idx");
+    expect(sql).toContain("status IN ('pending', 'success')");
+  });
+
+  it("maps grouped candidate rows and keeps unsubscribe URLs out of the query", async () => {
+    mockQuery.mockResolvedValue({
+      rows: [
+        {
+          sender: "news@example.com",
+          email_id: "email-9",
+          message_count: "4",
+          latest_subject: "Latest issue",
+          recent_subjects: ["Latest issue", "Earlier issue"],
+          last_received_at: "2026-08-01T12:00:00.000Z",
+        },
+      ],
+    });
+
+    const result = await getUnsubscribeCandidates(60, 3, 20);
+    const [sql, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+
+    expect(params).toEqual([60, 3, 20]);
+    expect(sql).toContain("DISTINCT ON (email_id)");
+    expect(sql).toContain("has_list_unsubscribe = true");
+    expect(sql).toContain("unsubscribe_actions");
+    expect(sql).toContain("interval '15 minutes'");
+    expect(sql).not.toContain("unsubscribe_url");
+    expect(result[0]).toMatchObject({
+      sender: "news@example.com",
+      emailId: "email-9",
+      messageCount: 4,
+      recentSubjects: ["Latest issue", "Earlier issue"],
+    });
+  });
+
+  it("starts an idempotent pending action and returns its ID", async () => {
+    mockQuery.mockResolvedValue({ rows: [{ action_id: 17 }] });
+
+    const actionId = await startUnsubscribeAction(
+      " News@Example.com ",
+      "email-9",
+      "one-click",
+      "rfc8058",
+      "news.example.com"
+    );
+    const [sql, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+
+    expect(actionId).toBe(17);
+    expect(sql).toContain("Previous attempt interrupted");
+    expect(sql).toContain("ON CONFLICT DO NOTHING");
+    expect(params).toEqual([
+      "news@example.com",
+      "email-9",
+      "one-click",
+      "rfc8058",
+      "news.example.com",
+    ]);
+  });
+
+  it("returns null when a sender already has an active action", async () => {
+    mockQuery.mockResolvedValue({ rows: [] });
+
+    await expect(
+      startUnsubscribeAction("news@example.com", "email-9", "one-click", "rfc8058")
+    ).resolves.toBeNull();
+  });
+
+  it("finishes an attempt without retaining more than 500 error characters", async () => {
+    mockQuery.mockResolvedValue({ rows: [] });
+
+    await finishUnsubscribeAction(17, "failed", 503, "x".repeat(700));
+    const [, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+
+    expect(params[0]).toBe(17);
+    expect(params[1]).toBe("failed");
+    expect(params[2]).toBe(503);
+    expect((params[3] as string).length).toBe(500);
+  });
+
+  it("records Keep as a completed human-review decision", async () => {
+    mockQuery
+      .mockResolvedValueOnce({ rows: [{ action_id: 22 }] })
+      .mockResolvedValueOnce({ rows: [] });
+
+    await keepUnsubscribeSender("news@example.com", "email-9");
+
+    expect(mockQuery).toHaveBeenCalledTimes(2);
+    expect((mockQuery.mock.calls[0] as unknown[])[1]).toEqual([
+      "news@example.com",
+      "email-9",
+      "keep",
+      "human-review",
+      null,
+    ]);
+    expect((mockQuery.mock.calls[1] as unknown[])[1]).toEqual([22, "success", null, null]);
   });
 });

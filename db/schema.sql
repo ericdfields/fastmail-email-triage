@@ -5,7 +5,7 @@
 --
 -- Safe to re-run: every statement is idempotent.
 --
--- Note: `corrections` and `attention_actions` are also created on demand at
+-- Note: `corrections`, `attention_actions`, and `unsubscribe_actions` are also created on demand at
 -- runtime (ensureCorrectionsTable / ensureAttentionActionsTable in src/db.ts).
 -- `triage_runs` and `classifications` are NOT — they must exist before the
 -- first `npm run triage`, which is what this file is for.
@@ -101,12 +101,35 @@ CREATE TABLE IF NOT EXISTS model_calls (
   created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Human-authorized unsubscribe decisions and the outcome of each one-click request.
+-- Full unsubscribe URLs are deliberately not retained because they often contain tokens.
+CREATE TABLE IF NOT EXISTS unsubscribe_actions (
+  action_id      BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  sender         TEXT NOT NULL,
+  email_id       TEXT NOT NULL,
+  action         TEXT NOT NULL CHECK (action IN ('one-click', 'keep')),
+  method         TEXT NOT NULL,
+  target_host    TEXT,
+  status         TEXT NOT NULL CHECK (status IN ('pending', 'success', 'failed')),
+  http_status    INTEGER,
+  error          TEXT,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  completed_at   TIMESTAMPTZ
+);
+
 -- Hot paths: the attention queue and the review list both scan by tier and
 -- order by recency.
 CREATE INDEX IF NOT EXISTS classifications_tier_idx ON classifications (tier);
 CREATE INDEX IF NOT EXISTS classifications_received_at_idx ON classifications (received_at DESC);
 CREATE INDEX IF NOT EXISTS classifications_email_classified_idx ON classifications (email_id, classified_at DESC);
 CREATE INDEX IF NOT EXISTS model_calls_created_at_idx ON model_calls (created_at DESC);
+CREATE INDEX IF NOT EXISTS unsubscribe_actions_sender_idx ON unsubscribe_actions (sender, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS unsubscribe_actions_active_sender_idx
+  ON unsubscribe_actions (sender)
+  WHERE status IN ('pending', 'success');
+CREATE INDEX IF NOT EXISTS classifications_unsubscribe_sender_idx
+  ON classifications (sender, received_at DESC)
+  WHERE has_list_unsubscribe = true;
 CREATE INDEX IF NOT EXISTS classifications_success_email_idx
   ON classifications (email_id)
   WHERE reason <> 'Classification failed — defaulting to confirm';

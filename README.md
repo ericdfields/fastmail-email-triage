@@ -10,6 +10,8 @@ Two halves:
   actions. Runs hourly under launchd.
 - **Attention processing** (`npm run act`, or the web UI) — the human pass. Works through
   the `attention` pile one email at a time: archive it, snooze it, or reclassify it.
+- **Unsubscribe review** (web UI) — groups recurring List-Unsubscribe senders for explicit
+  bulk approval. It uses no model calls and only executes verified RFC 8058 one-click requests.
 
 ## Tiers
 
@@ -79,7 +81,8 @@ doppler run -- bash -c 'psql "$DATABASE_URL" -f db/schema.sql'
 ```
 
 `db/schema.sql` is idempotent and creates all six tables plus the `tier` enum. (The
-`corrections`, `attention_actions`, `sender_rules`, and `model_calls` tables are also auto-created at runtime, but
+`corrections`, `attention_actions`, `sender_rules`, `model_calls`, and `unsubscribe_actions`
+tables are also auto-created at runtime, but
 `triage_runs` and `classifications` are not — they must exist before the first run.)
 
 ### 6. Verify before letting it loose
@@ -136,9 +139,16 @@ the model; domain-wide rules are never inferred automatically.
 npm run server   # http://localhost:3100
 ```
 
-Mobile-friendly dark UI with two tabs — **Attention** (the default; act / snooze /
-reclassify from your phone) and **Review** (lazy-loaded; browse and correct recent
-classifications).
+Mobile-friendly dark UI with three tabs — **Attention** (the default; act / snooze /
+reclassify from your phone), **Review** (browse and correct recent classifications), and
+**Unsubscribe** (review recurring senders and approve one-click requests in batches of 25).
+
+The unsubscribe review is deliberately human-gated. Candidates need at least two messages
+in the last 90 days. The browser never receives the full unsubscribe URL, HTTPS targets are
+re-fetched from Fastmail at approval time, private-network destinations and redirects are
+rejected, and only `List-Unsubscribe-Post: List-Unsubscribe=One-Click` endpoints with passing
+DKIM authentication covering both unsubscribe headers are executed.
+Choosing **Keep** suppresses future suggestions for that exact sender.
 
 API routes, all JSON:
 
@@ -151,6 +161,10 @@ API routes, all JSON:
 | `POST` | `/api/attention/act` |
 | `POST` | `/api/attention/snooze` |
 | `POST` | `/api/attention/reclassify` |
+| `GET` | `/api/unsubscribe/count` |
+| `GET` | `/api/unsubscribe/candidates` |
+| `POST` | `/api/unsubscribe/process` |
+| `POST` | `/api/unsubscribe/keep` |
 
 The server has **no authentication** — it is meant to sit behind Cloudflare Access. Do
 not expose port 3100 directly.
@@ -186,7 +200,7 @@ loop is recoverable. On the next start:
 
 ## Database
 
-Six tables plus a `tier` enum — see [`db/schema.sql`](db/schema.sql) for the full DDL.
+Seven tables plus a `tier` enum — see [`db/schema.sql`](db/schema.sql) for the full DDL.
 
 | Table | Holds |
 |-------|-------|
@@ -196,6 +210,7 @@ Six tables plus a `tier` enum — see [`db/schema.sql`](db/schema.sql) for the f
 | `attention_actions` | Which attention emails were acted on or snoozed, and until when |
 | `sender_rules` | Exact normalized sender decisions learned from explicit corrections |
 | `model_calls` | Per-attempt model, token, cache, cost, latency, and failure accounting |
+| `unsubscribe_actions` | Human keep/unsubscribe decisions and one-click outcomes; full URLs are never retained |
 
 ---
 

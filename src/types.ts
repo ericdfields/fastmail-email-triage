@@ -38,3 +38,11 @@ export interface ActionResult {
   success: boolean;
   error?: string;
 }
+
+export interface UnsubscribeHeaders {
+  emailId: string;
+  urls: string[] | null;
+  listUnsubscribePost: string | null;
+  authenticationResults: string[];
+  dkimSignatures: string[];
+}

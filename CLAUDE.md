@@ -38,6 +38,7 @@ src/
   correct.ts    — Classification review TUI
   accuracy.ts   — Accuracy stats CLI
   cleanup.ts    — Standalone inbox cleanup (archive read mail older than 1 month)
+  unsubscribe.ts — RFC 8058 parsing, public-network validation, and pinned-address HTTPS POSTs
   *.test.ts     — Vitest unit tests for jmap, db, classifier
 db/schema.sql   — Full schema, idempotent
 launchd/        — launchd plists for scheduled services
@@ -114,7 +115,7 @@ machine.
 
 ## Database schema
 
-Postgres, a `tier` ENUM, and six tables. The authoritative DDL is
+Postgres, a `tier` ENUM, and seven tables. The authoritative DDL is
 [`db/schema.sql`](db/schema.sql) — **update that file when you change the schema.**
 
 | Table | Purpose |
@@ -125,8 +126,10 @@ Postgres, a `tier` ENUM, and six tables. The authoritative DDL is
 | `attention_actions` | `acted` / `snoozed` per attention email, with optional note and `snoozed_until` |
 | `sender_rules` | Exact normalized sender rules learned from corrections |
 | `model_calls` | Token, cache, cost, latency, and failure data for each model attempt |
+| `unsubscribe_actions` | Approved one-click/keep decisions and outcome audit data, without full URLs |
 
-`corrections`, `attention_actions`, `sender_rules`, and `model_calls` are auto-created at runtime.
+`corrections`, `attention_actions`, `sender_rules`, `model_calls`, and `unsubscribe_actions`
+are auto-created at runtime.
 `triage_runs` and
 `classifications` are not — a fresh database needs `db/schema.sql` first.
 
@@ -187,8 +190,14 @@ triage, and the running server for UI work.
   auto-archives without a model call
 - **Failure behavior**: both model failures abort the run without writing classifications;
   mail remains unread and the failed heartbeat is sent
-- **Web UI**: Hono on port 3100, dark mobile UI, Attention tab default, Review lazy-loaded.
+- **Web UI**: Hono on port 3100, dark mobile UI, Attention tab default, Review and
+  Unsubscribe lazy-loaded. The unsubscribe tab requires a second confirmation click and
+  processes at most 25 exact senders per batch.
   **No authentication** — it is meant to sit behind Cloudflare Access, not be exposed
+- **Unsubscribe safety**: candidate URLs are re-fetched from JMAP at approval time and never
+  sent to the browser or stored. Only DKIM-authenticated RFC 8058 HTTPS one-click endpoints
+  on port 443 are posted; DNS is validated and pinned to prevent private-network requests,
+  and redirects fail.
 - **DB connection**: SSL with `rejectUnauthorized: false`, pool `max: 3` (keeps the hourly
   launchd job from exhausting connections on the managed instance)
 - **Scheduled services**: launchd plists for server, hourly triage, and Cloudflare Tunnel.

@@ -3,7 +3,16 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 const mockFetch = vi.hoisted(() => vi.fn());
 vi.stubGlobal("fetch", mockFetch);
 
-import { getSession, getMailboxIds, applyActions, fetchAllUnread, fetchEmailBodies, archiveEmail, applyTierAction } from "./jmap.js";
+import {
+  getSession,
+  getMailboxIds,
+  applyActions,
+  fetchAllUnread,
+  fetchEmailBodies,
+  fetchUnsubscribeHeaders,
+  archiveEmail,
+  applyTierAction,
+} from "./jmap.js";
 import type { Classification, EmailSummary, JMAPSession, MailboxIds } from "./types.js";
 
 const session: JMAPSession = {
@@ -162,6 +171,49 @@ describe("getMailboxIds", () => {
     );
 
     await expect(getMailboxIds(session)).rejects.toThrow("Could not find inbox mailbox");
+  });
+});
+
+describe("fetchUnsubscribeHeaders", () => {
+  it("fetches RFC 8058 headers without exposing email bodies", async () => {
+    mockFetch.mockResolvedValue(
+      makeJmapResponse([
+        [
+          "Email/get",
+          {
+            list: [
+              {
+                id: "email-1",
+                "header:List-Unsubscribe:asURLs": ["https://news.example.com/leave"],
+                "header:List-Unsubscribe-Post:asText": "List-Unsubscribe=One-Click",
+                "header:Authentication-Results:asText:all": ["mx.fastmail.com; dkim=pass header.d=example.com"],
+                "header:DKIM-Signature:asText:all": ["v=1; d=example.com; h=from:list-unsubscribe:list-unsubscribe-post"],
+              },
+            ],
+          },
+          "unsubscribe0",
+        ],
+      ])
+    );
+
+    const result = await fetchUnsubscribeHeaders(session, ["email-1"]);
+    const requestBody = JSON.parse((mockFetch.mock.calls[0] as any[])[1].body);
+    const properties = requestBody.methodCalls[0][1].properties;
+
+    expect(result.get("email-1")).toEqual({
+      emailId: "email-1",
+      urls: ["https://news.example.com/leave"],
+      listUnsubscribePost: "List-Unsubscribe=One-Click",
+      authenticationResults: ["mx.fastmail.com; dkim=pass header.d=example.com"],
+      dkimSignatures: ["v=1; d=example.com; h=from:list-unsubscribe:list-unsubscribe-post"],
+    });
+    expect(properties).not.toContain("bodyValues");
+    expect(properties).not.toContain("preview");
+  });
+
+  it("does not call JMAP for an empty list", async () => {
+    expect(await fetchUnsubscribeHeaders(session, [])).toEqual(new Map());
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 });
 
