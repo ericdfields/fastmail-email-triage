@@ -44,8 +44,8 @@ CREATE TABLE IF NOT EXISTS classifications (
   PRIMARY KEY (email_id, run_id)
 );
 
--- Human corrections to a classification. Fed back into the classifier prompt
--- as in-context examples (aggregated by sender, most recent 50).
+-- Human corrections to a classification. Each correction also becomes an exact-sender
+-- rule so later messages from that sender bypass the model.
 CREATE TABLE IF NOT EXISTS corrections (
   correction_id  BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   email_id       TEXT NOT NULL,
@@ -72,8 +72,41 @@ CREATE TABLE IF NOT EXISTS attention_actions (
   UNIQUE (email_id, run_id)
 );
 
+-- Exact sender decisions learned from explicit human corrections. These rules bypass
+-- model calls for future messages from the same normalized sender string.
+CREATE TABLE IF NOT EXISTS sender_rules (
+  sender      TEXT PRIMARY KEY,
+  tier        tier NOT NULL,
+  source      TEXT NOT NULL DEFAULT 'correction',
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- One row per OpenRouter attempt. Used for the daily budget circuit breaker and
+-- operational visibility into tokens, cache hits, latency, and provider failures.
+CREATE TABLE IF NOT EXISTS model_calls (
+  model_call_id      BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  run_id             BIGINT NOT NULL REFERENCES triage_runs(run_id),
+  model              TEXT NOT NULL,
+  attempt            INTEGER NOT NULL,
+  status             TEXT NOT NULL CHECK (status IN ('success', 'failed')),
+  batch_size         INTEGER NOT NULL,
+  input_tokens       INTEGER NOT NULL DEFAULT 0,
+  output_tokens      INTEGER NOT NULL DEFAULT 0,
+  cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
+  cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+  cost_usd           NUMERIC(12, 8) NOT NULL DEFAULT 0,
+  latency_ms         INTEGER NOT NULL,
+  error_type         TEXT,
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- Hot paths: the attention queue and the review list both scan by tier and
 -- order by recency.
 CREATE INDEX IF NOT EXISTS classifications_tier_idx ON classifications (tier);
 CREATE INDEX IF NOT EXISTS classifications_received_at_idx ON classifications (received_at DESC);
 CREATE INDEX IF NOT EXISTS classifications_email_classified_idx ON classifications (email_id, classified_at DESC);
+CREATE INDEX IF NOT EXISTS model_calls_created_at_idx ON model_calls (created_at DESC);
+CREATE INDEX IF NOT EXISTS classifications_success_email_idx
+  ON classifications (email_id)
+  WHERE reason <> 'Classification failed — defaulting to confirm';

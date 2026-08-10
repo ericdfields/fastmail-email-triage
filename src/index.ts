@@ -1,5 +1,5 @@
 import { getSession, getMailboxIds, fetchAllUnread, applyActions } from "./jmap.js";
-import { classifyBatch } from "./classifier.js";
+import { BACKUP_MODEL, PRIMARY_MODEL, classifyBatch } from "./classifier.js";
 import {
   initDb,
   closeDb,
@@ -8,35 +8,57 @@ import {
   insertClassifications,
   markActionsApplied,
   completeRun,
-  getRunSummary,
-  getRecentCorrections,
   ensureCorrectionsTable,
+  ensureOptimizationTables,
+  getPreviouslyClassifiedEmailIds,
+  getSenderRules,
+  getTodayModelSpend,
+  recordModelCall,
 } from "./db.js";
-import type { Classification, MailboxIds } from "./types.js";
+import { routeDeterministically, senderKey } from "./routing.js";
+import type { Classification, MailboxIds, Tier } from "./types.js";
+
+const DEFAULT_DAILY_BUDGET_USD = 1;
+
+function dailyBudgetUsd(): number {
+  const configured = Number(process.env.OPENROUTER_DAILY_BUDGET_USD ?? DEFAULT_DAILY_BUDGET_USD);
+  return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_DAILY_BUDGET_USD;
+}
+
+async function pingHeartbeat(status: "up" | "down", message: string): Promise<void> {
+  if (!process.env.UPTIME_KUMA_PUSH_URL) return;
+  const url = new URL(process.env.UPTIME_KUMA_PUSH_URL);
+  url.searchParams.set("status", status);
+  url.searchParams.set("msg", message);
+  url.searchParams.set("ping", "");
+  await fetch(url);
+}
 
 async function main() {
   if (!process.env.FASTMAIL_API_TOKEN)
     throw new Error("Missing FASTMAIL_API_TOKEN");
-  if (!process.env.ANTHROPIC_API_KEY)
-    throw new Error("Missing ANTHROPIC_API_KEY");
+  if (!process.env.OPENROUTER_API_KEY)
+    throw new Error("Missing OPENROUTER_API_KEY");
 
-  const model = process.argv.includes("--haiku")
-    ? "claude-haiku-4-5-20251001"
-    : "claude-sonnet-4-6";
   const watchMode = process.argv.includes("--watch");
   const dryRun = process.argv.includes("--dry-run");
   const POLL_INTERVAL = 60_000;
-  console.log(`Model: ${model}${watchMode ? " (watch mode)" : ""}${dryRun ? " (dry run)" : ""}`);
+  const budgetUsd = dailyBudgetUsd();
+  console.log(`Models: ${PRIMARY_MODEL} → ${BACKUP_MODEL}`);
+  console.log(`Daily OpenRouter budget: $${budgetUsd.toFixed(2)}${watchMode ? " (watch mode)" : ""}${dryRun ? " (dry run)" : ""}`);
 
   initDb();
   await ensureCorrectionsTable();
+  await ensureOptimizationTables();
 
   // Check for an incomplete run to resume
-  const partial = await findIncompleteRun();
+  // A dry run must never complete or otherwise mutate an in-progress production run.
+  const partial = dryRun ? null : await findIncompleteRun();
   let runId: number;
   const alreadyClassified = new Set<string>();
   let alreadyActed = new Set<string>();
   let totalClassified = 0;
+  const summaryCounts: Partial<Record<Tier, number>> = {};
 
   if (partial) {
     runId = partial.runId;
@@ -45,6 +67,7 @@ async function main() {
     console.log(`  ${partial.classifications.length} classified, ${alreadyActed.size} acted`);
     for (const c of partial.classifications) {
       alreadyClassified.add(c.emailId);
+      summaryCounts[c.tier] = (summaryCounts[c.tier] ?? 0) + 1;
     }
     totalClassified = partial.classifications.length;
   } else {
@@ -90,18 +113,18 @@ async function main() {
     });
   }
 
-  const corrections = await getRecentCorrections();
-  if (corrections.length > 0) {
-    console.log(`Loaded ${corrections.length} correction patterns for classifier`);
-  }
-
   while (true) {
     let batchesThisPoll = 0;
 
     for await (const batch of fetchAllUnread(session, mailboxIds.inbox)) {
       if (stopping) break;
 
-      const newEmails = batch.filter((e) => !alreadyClassified.has(e.id));
+      const candidates = batch.filter((email) => !alreadyClassified.has(email.id));
+      const previouslyClassified = await getPreviouslyClassifiedEmailIds(
+        candidates.map((email) => email.id)
+      );
+      for (const emailId of previouslyClassified) alreadyClassified.add(emailId);
+      const newEmails = candidates.filter((email) => !previouslyClassified.has(email.id));
 
       batchNum++;
       if (newEmails.length === 0) {
@@ -118,26 +141,53 @@ async function main() {
           (skipped > 0 ? ` (${skipped} already classified, skipped)` : "")
       );
 
-      let classifications: Classification[];
-      let isFallback = false;
+      const senderRules = await getSenderRules(newEmails.map(senderKey));
+      const { deterministic, modelEmails } = routeDeterministically(newEmails, senderRules);
+
+      let modelClassifications: Classification[] = [];
 
       try {
-        classifications = await classifyBatch(newEmails, model, corrections);
+        modelClassifications = await classifyBatch(modelEmails, {
+          beforeAttempt: async () => {
+            const spent = await getTodayModelSpend();
+            if (spent >= budgetUsd) {
+              const error = new Error(
+                `Daily OpenRouter budget reached ($${spent.toFixed(4)} of $${budgetUsd.toFixed(2)})`
+              );
+              error.name = "DailyBudgetExceededError";
+              throw error;
+            }
+          },
+          onAttempt: async (attempt) => {
+            await recordModelCall(runId, attempt);
+            const status = attempt.success ? "succeeded" : "failed";
+            console.log(
+              `  ${attempt.model} ${status}: ${attempt.usage.inputTokens} in, ` +
+              `${attempt.usage.outputTokens} out, $${attempt.usage.costUsd.toFixed(6)}, ` +
+              `${attempt.latencyMs}ms`
+            );
+          },
+        });
       } catch (err) {
-        console.error(`  Classification failed:`, err);
-        classifications = newEmails.map((email) => ({
-          emailId: email.id,
-          subject: email.subject,
-          from: email.from.map((f) => f.email).join(", "),
-          receivedAt: email.receivedAt,
-          tier: "confirm",
-          reason: "Classification failed — defaulting to confirm",
-          hasListUnsubscribe: email.hasListUnsubscribe,
-        }));
-        isFallback = true;
+        console.error("  Classification batch failed; stopping run:", err);
+        throw err;
       }
 
-      await insertClassifications(runId, classifications);
+      const byEmailId = new Map(
+        [...deterministic, ...modelClassifications].map((classification) => [
+          classification.emailId,
+          classification,
+        ])
+      );
+      const classifications = newEmails.map((email) => byEmailId.get(email.id)!);
+
+      console.log(
+        `  Routing: ${deterministic.length} deterministic, ${modelEmails.length} model`
+      );
+
+      if (!dryRun) {
+        await insertClassifications(runId, classifications);
+      }
       totalClassified += classifications.length;
       for (const c of classifications) alreadyClassified.add(c.emailId);
 
@@ -148,10 +198,13 @@ async function main() {
         },
         {} as Record<string, number>
       );
+      for (const [tier, count] of Object.entries(tierCounts)) {
+        const typedTier = tier as Tier;
+        summaryCounts[typedTier] = (summaryCounts[typedTier] ?? 0) + count;
+      }
       console.log(`  Classified: ${JSON.stringify(tierCounts)}`);
 
-      // Apply actions (skip for fallback classifications and dry runs)
-      if (!isFallback && !dryRun) {
+      if (!dryRun) {
         try {
           const results = await applyActions(session, mailboxIds, classifications);
           const succeeded = results.filter((r) => r.success).map((r) => r.emailId);
@@ -183,23 +236,18 @@ async function main() {
 
   await completeRun(runId, totalClassified);
 
-  const summary = await getRunSummary(runId);
-
   console.log(`\n--- Summary (run #${runId}) ---`);
   console.log(`Total: ${totalClassified}`);
-  console.log(`  auto-delete:  ${summary.counts["auto-delete"] ?? 0}`);
-  console.log(`  auto-archive: ${summary.counts["auto-archive"] ?? 0}`);
-  console.log(`  confirm:      ${summary.counts["confirm"] ?? 0}`);
-  console.log(`  attention:    ${summary.counts["attention"] ?? 0}`);
+  console.log(`  auto-delete:  ${summaryCounts["auto-delete"] ?? 0}`);
+  console.log(`  auto-archive: ${summaryCounts["auto-archive"] ?? 0}`);
+  console.log(`  confirm:      ${summaryCounts["confirm"] ?? 0}`);
+  console.log(`  attention:    ${summaryCounts["attention"] ?? 0}`);
 
-  // Ping Uptime Kuma heartbeat
-  if (process.env.UPTIME_KUMA_PUSH_URL) {
-    try {
-      await fetch(`${process.env.UPTIME_KUMA_PUSH_URL}?status=up&msg=OK&ping=`);
-      console.log("Uptime Kuma heartbeat sent");
-    } catch (err) {
-      console.error("Uptime Kuma heartbeat failed:", err);
-    }
+  try {
+    await pingHeartbeat("up", "OK");
+    if (process.env.UPTIME_KUMA_PUSH_URL) console.log("Uptime Kuma heartbeat sent");
+  } catch (err) {
+    console.error("Uptime Kuma heartbeat failed:", err);
   }
 
   await closeDb();
@@ -208,6 +256,11 @@ async function main() {
 
 main().catch(async (err) => {
   console.error("Fatal error:", err);
+  try {
+    await pingHeartbeat("down", "Email classification failed");
+  } catch (heartbeatError) {
+    console.error("Uptime Kuma failure heartbeat failed:", heartbeatError);
+  }
   try {
     await closeDb();
   } catch {}

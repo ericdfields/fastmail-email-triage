@@ -2,6 +2,7 @@ import {
   initDb,
   closeDb,
   ensureCorrectionsTable,
+  ensureOptimizationTables,
   getRecentClassifications,
   insertCorrection,
 } from "./db.js";
@@ -286,6 +287,7 @@ async function main() {
 
   initDb();
   await ensureCorrectionsTable();
+  await ensureOptimizationTables();
 
   const args = process.argv.slice(2);
 

@@ -2,6 +2,8 @@ import {
   initDb,
   closeDb,
   ensureAttentionActionsTable,
+  ensureCorrectionsTable,
+  ensureOptimizationTables,
   getAttentionQueue,
   getAttentionQueueCount,
   recordAttentionAction,
@@ -38,6 +40,8 @@ async function main() {
   const batchSize = parseBatchSize();
 
   initDb();
+  await ensureCorrectionsTable();
+  await ensureOptimizationTables();
   await ensureAttentionActionsTable();
 
   const session = await getSession();
