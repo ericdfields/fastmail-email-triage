@@ -1,5 +1,6 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
+import { pathToFileURL } from "node:url";
 import {
   initDb,
   closeDb,
@@ -33,7 +34,7 @@ import {
 import type { Tier, JMAPSession, MailboxIds } from "./types.js";
 
 const TIERS: Tier[] = ["auto-delete", "auto-archive", "confirm", "attention"];
-const app = new Hono();
+export const app = new Hono();
 
 let jmapSession: JMAPSession | null = null;
 let jmapMailboxIds: MailboxIds | null = null;
@@ -2032,7 +2033,9 @@ async function start() {
   });
 }
 
-start().catch((err) => {
-  console.error("Server failed to start:", err);
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  start().catch((err) => {
+    console.error("Server failed to start:", err);
+    process.exit(1);
+  });
+}
