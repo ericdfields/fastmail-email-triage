@@ -31,6 +31,16 @@ import {
   selectOneClickUrl,
   unsubscribeOneClick,
 } from "./unsubscribe.js";
+import {
+  ensureJobTables,
+  getJobCounts,
+  getJobs,
+  JOB_VIEWS,
+  recordJobDecision,
+  retryJobResearch,
+} from "./jobsDb.js";
+import type { JobView } from "./jobsDb.js";
+import { runPendingResearch } from "./jobResearch.js";
 import type { Tier, JMAPSession, MailboxIds } from "./types.js";
 
 const TIERS: Tier[] = ["auto-delete", "auto-archive", "confirm", "attention"];
@@ -351,6 +361,63 @@ app.post("/api/unsubscribe/keep", async (c) => {
   if (!candidate) return c.json({ error: "Candidate is stale or invalid" }, 409);
 
   await keepUnsubscribeSender(candidate.sender, candidate.emailId);
+  return c.json({ success: true });
+});
+
+// --- Jobs ---
+
+let researchRunning = false;
+
+/** Drain the research queue in the background. One loop at a time per process. */
+export function kickResearch(): void {
+  if (researchRunning) return;
+  researchRunning = true;
+  (async () => {
+    try {
+      while ((await runPendingResearch(2)) > 0) {}
+    } catch (err) {
+      console.error("Job research failed:", err);
+    } finally {
+      researchRunning = false;
+    }
+  })();
+}
+
+function parseJobId(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+app.get("/api/jobs", async (c) => {
+  const view = (c.req.query("view") ?? "review") as JobView;
+  if (!JOB_VIEWS.includes(view)) return c.json({ error: "Unknown view" }, 400);
+  const limit = Math.min(Math.max(parseInt(c.req.query("limit") ?? "50") || 50, 1), 100);
+  const offset = Math.max(parseInt(c.req.query("offset") ?? "0") || 0, 0);
+  return c.json(await getJobs(view, limit, offset));
+});
+
+app.get("/api/jobs/counts", async (c) => {
+  return c.json(await getJobCounts());
+});
+
+app.post("/api/jobs/decision", async (c) => {
+  const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
+  const jobId = parseJobId(body?.jobId);
+  const decision = body?.decision;
+  const note = typeof body?.note === "string" && body.note.trim() ? body.note.trim() : undefined;
+  if (!jobId || (decision !== "yay" && decision !== "nay")) {
+    return c.json({ error: "jobId and decision (yay or nay) are required" }, 400);
+  }
+  if (!(await recordJobDecision(jobId, decision, note))) return c.json({ error: "Job not found" }, 404);
+  if (decision === "yay") kickResearch();
+  return c.json({ success: true });
+});
+
+app.post("/api/jobs/research/retry", async (c) => {
+  const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
+  const jobId = parseJobId(body?.jobId);
+  if (!jobId) return c.json({ error: "jobId is required" }, 400);
+  if (!(await retryJobResearch(jobId))) return c.json({ error: "Nothing to retry" }, 409);
+  kickResearch();
   return c.json({ success: true });
 });
 
@@ -746,7 +813,7 @@ app.get("/", (c) => {
     font-size: 0.82rem;
     font-weight: 600;
     letter-spacing: 0.01em;
-    padding: 8px 16px;
+    padding: 8px 10px;
     border-radius: 20px;
     cursor: pointer;
     transition: all 0.2s ease;
@@ -1208,6 +1275,173 @@ app.get("/", (c) => {
     font-size: 0.72rem;
   }
 
+  /* Jobs */
+  .job-filters {
+    display: flex;
+    gap: 6px;
+    padding: 10px 10px 4px;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .job-filters::-webkit-scrollbar { display: none; }
+
+  .job-filter {
+    appearance: none;
+    flex-shrink: 0;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text-muted);
+    font-family: var(--font);
+    font-size: 0.74rem;
+    font-weight: 600;
+    min-height: 34px;
+    padding: 0 12px;
+    border-radius: 17px;
+    cursor: pointer;
+  }
+
+  .job-filter.active {
+    background: rgba(228, 228, 235, 0.08);
+    border-color: var(--border-hover);
+    color: var(--text);
+  }
+
+  .job-filter .n {
+    color: var(--text-dim);
+    font-variant-numeric: tabular-nums;
+    margin-left: 4px;
+  }
+
+  .job-hint {
+    color: var(--text-dim);
+    font-size: 0.74rem;
+    padding: 4px 14px 2px;
+  }
+
+  .job-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px;
+    animation: fadeUp 0.3s ease both;
+    transition: opacity 0.25s ease, transform 0.25s ease;
+  }
+
+  .job-card.removing { opacity: 0; transform: translateY(-10px); }
+
+  .job-head { cursor: pointer; -webkit-tap-highlight-color: transparent; }
+
+  .job-title {
+    font-weight: 650;
+    font-size: 0.95rem;
+    line-height: 1.3;
+    letter-spacing: -0.01em;
+    overflow-wrap: anywhere;
+  }
+
+  .job-company {
+    color: var(--text-muted);
+    font-size: 0.84rem;
+    margin-top: 2px;
+    overflow-wrap: anywhere;
+  }
+
+  .job-facts {
+    color: var(--text-dim);
+    font-size: 0.74rem;
+    margin-top: 4px;
+  }
+
+  .badge-yay { color: var(--tier-attention); background: var(--tier-attention-bg); }
+  .badge-maybe { color: var(--tier-confirm); background: var(--tier-confirm-bg); }
+  .badge-nay { color: var(--tier-delete); background: var(--tier-delete-bg); }
+  .badge-warm { color: var(--tier-archive); background: var(--tier-archive-bg); }
+  .badge-plain { color: var(--text-muted); background: rgba(110, 110, 130, 0.12); }
+
+  .job-reason {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    margin-top: 8px;
+    line-height: 1.45;
+  }
+
+  .job-more { display: none; margin-top: 10px; }
+  .job-card.expanded .job-more { display: block; }
+
+  .job-more a, .job-research a { color: #67e8f9; text-decoration: none; }
+
+  .job-line {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    margin-top: 4px;
+    line-height: 1.45;
+    overflow-wrap: anywhere;
+  }
+
+  .job-line b { color: var(--text-dim); font-weight: 600; }
+
+  .job-actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 10px;
+  }
+
+  .job-btn {
+    appearance: none;
+    background: transparent;
+    font-family: var(--font);
+    font-size: 0.8rem;
+    font-weight: 650;
+    min-height: 44px;
+    padding: 0 14px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    flex: 1;
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+  }
+
+  .job-btn:active { transform: scale(0.96); }
+  .job-btn:disabled { opacity: 0.4; cursor: default; }
+  .job-btn-yay { border-color: rgba(34, 197, 94, 0.35); color: var(--tier-attention); }
+  .job-btn-nay { border-color: rgba(239, 68, 68, 0.35); color: var(--tier-delete); }
+  .job-btn-small { flex: 0 0 auto; min-height: 34px; font-size: 0.72rem; }
+
+  .job-research {
+    margin-top: 12px;
+    border-top: 1px solid var(--border);
+    padding-top: 10px;
+  }
+
+  .job-section {
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin-top: 10px;
+  }
+
+  .job-draft {
+    white-space: pre-wrap;
+    font-family: var(--font);
+    font-size: 0.82rem;
+    line-height: 1.5;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 10px 12px;
+    margin-top: 6px;
+    overflow-wrap: anywhere;
+  }
+
+  .job-warning {
+    font-size: 0.75rem;
+    color: var(--tier-archive);
+    margin-top: 4px;
+  }
+
   @media (min-width: 760px) {
     #app { max-width: 820px; margin: 0 auto; }
     .header { border-left: 1px solid var(--border); border-right: 1px solid var(--border); }
@@ -1233,7 +1467,8 @@ app.get("/", (c) => {
   <div class="tabs">
     <button class="tab active" data-tab="attention">Attention <span class="tab-badge" id="attnBadge"></span></button>
     <button class="tab" data-tab="review">Review</button>
-    <button class="tab" data-tab="unsubscribe">Unsubscribe <span class="tab-badge" id="unsubBadge"></span></button>
+    <button class="tab" data-tab="jobs">Jobs <span class="tab-badge" id="jobsBadge"></span></button>
+    <button class="tab" data-tab="unsubscribe">Unsub <span class="tab-badge" id="unsubBadge"></span></button>
   </div>
   <div class="view" id="reviewView">
     <div class="list" id="list"></div>
@@ -1248,6 +1483,18 @@ app.get("/", (c) => {
       <button class="btn-load-more" id="attnLoadMoreBtn">Load more</button>
     </div>
     <div class="empty" id="attnEmpty" style="display:none">No attention emails pending.</div>
+  </div>
+  <div class="view" id="jobsView">
+    <div class="job-filters" id="jobFilters">
+      <button class="job-filter active" data-view="review">To review<span class="n" data-count="review"></span></button>
+      <button class="job-filter" data-view="yay">Yay<span class="n" data-count="yay"></span></button>
+      <button class="job-filter" data-view="nay">Hidden nays<span class="n" data-count="nay"></span></button>
+      <button class="job-filter" data-view="in-process">In process<span class="n" data-count="in-process"></span></button>
+      <button class="job-filter" data-view="passed">Passed<span class="n" data-count="passed"></span></button>
+    </div>
+    <div class="job-hint" id="jobHint"></div>
+    <div class="list" id="jobList"></div>
+    <div class="empty" id="jobEmpty" style="display:none"></div>
   </div>
   <div class="view" id="unsubscribeView">
     <section class="unsub-intro">
@@ -1370,7 +1617,7 @@ app.get("/", (c) => {
   }
 
   function escHtml(s) {
-    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   }
 
   function render() {
@@ -1502,6 +1749,8 @@ app.get("/", (c) => {
       loadClassifications(true);
     } else if (activeTab === 'unsubscribe') {
       loadUnsubscribe();
+    } else if (activeTab === 'jobs') {
+      loadJobs(false);
     } else {
       loadAttention(true);
     }
@@ -1518,6 +1767,15 @@ app.get("/", (c) => {
       reviewView.classList.toggle('active', target === 'review');
       attentionView.classList.toggle('active', target === 'attention');
       unsubscribeView.classList.toggle('active', target === 'unsubscribe');
+      jobsView.classList.toggle('active', target === 'jobs');
+      if (target === 'jobs') {
+        if (!jobsLoaded) {
+          jobsLoaded = true;
+          loadJobs(false);
+        } else {
+          scheduleJobPoll();
+        }
+      }
       if (target === 'attention' && attnItems.length === 0) {
         loadAttention(true);
       }
@@ -2000,12 +2258,284 @@ app.get("/", (c) => {
     }
   });
 
+  // --- Jobs ---
+  var JOB_HINTS = {
+    'review': 'Screened as yay or maybe. A yay starts research on the company and a contact.',
+    'yay': 'Your yays, with research. Check every name against its source before you reach out.',
+    'nay': 'The screen hid these. Un-nay anything it got wrong; your decision trains the next screen.',
+    'in-process': 'Companies where you already have an application or conversation.',
+    'passed': 'Jobs you passed on.'
+  };
+  var JOB_EMPTY = {
+    'review': 'Nothing to review.',
+    'yay': 'No yays yet.',
+    'nay': 'No hidden nays.',
+    'in-process': 'No alerts from companies in your pipeline.',
+    'passed': 'Nothing passed yet.'
+  };
+  var jobView = 'review';
+  var jobItems = [];
+  var jobsLoading = false;
+  var jobsLoaded = false;
+  var jobPollTimer = null;
+  var expandedJobs = new Set();
+  const jobsView = document.getElementById('jobsView');
+  const jobListEl = document.getElementById('jobList');
+  const jobEmptyEl = document.getElementById('jobEmpty');
+  const jobHintEl = document.getElementById('jobHint');
+  const jobsBadgeEl = document.getElementById('jobsBadge');
+  const jobFiltersEl = document.getElementById('jobFilters');
+
+  function safeUrl(url) {
+    return typeof url === 'string' && /^https?:\\/\\//i.test(url) ? url : null;
+  }
+
+  function linkHtml(url, label) {
+    var safe = safeUrl(url);
+    if (!safe) return escHtml(label);
+    return '<a href="' + escHtml(safe) + '" target="_blank" rel="noopener noreferrer">' + escHtml(label) + '</a>';
+  }
+
+  function jobPay(job) {
+    if (job.salaryMin == null && job.salaryMax == null) return 'pay not listed';
+    function k(n) { return n == null ? '?' : '$' + Math.round(n / 1000) + 'K'; }
+    return k(job.salaryMin) + '–' + k(job.salaryMax);
+  }
+
+  function peopleHtml(label, people) {
+    if (!people || people.length === 0) return '';
+    return '<div class="job-section">' + escHtml(label) + '</div>' + people.map(function(p) {
+      return '<div class="job-line">' + escHtml(p.name) + (p.title ? ', ' + escHtml(p.title) : '')
+        + ' · ' + linkHtml(p.sourceUrl, 'source') + '</div>';
+    }).join('');
+  }
+
+  var RESEARCH_LABELS = {
+    pending: 'Research queued',
+    running: 'Researching…',
+    done: 'Research done',
+    closed: 'Posting looks closed',
+    failed: 'Research failed'
+  };
+
+  function researchHtml(job) {
+    var r = job.research;
+    if (!r) return '';
+    var html = '<div class="job-research"><div class="card-meta"><span class="badge badge-plain">'
+      + escHtml(RESEARCH_LABELS[r.status] || r.status) + '</span>';
+    if (r.status === 'failed' || r.status === 'done' || r.status === 'closed') {
+      html += '<button class="job-btn job-btn-small" data-action="retry">Research again</button>';
+    }
+    html += '</div>';
+    if (r.error) html += '<div class="job-warning">' + escHtml(r.error) + '</div>';
+    var posting = r.posting;
+    if (posting) {
+      html += '<div class="job-line"><b>Posting:</b> ' + escHtml(posting.status) + (posting.posted ? ', posted ' + escHtml(posting.posted) : '')
+        + (posting.evidence ? '. ' + escHtml(posting.evidence) : '') + '</div>';
+    }
+    var company = r.company;
+    if (company) {
+      if (company.summary) html += '<div class="job-section">Company</div><div class="job-line">' + escHtml(company.summary) + '</div>';
+      if (company.aiWork) html += '<div class="job-line"><b>AI work:</b> ' + escHtml(company.aiWork) + '</div>';
+      if (company.engineeringOrg) html += '<div class="job-line"><b>Engineering:</b> ' + escHtml(company.engineeringOrg) + '</div>';
+      if (safeUrl(company.careersUrl)) html += '<div class="job-line">' + linkHtml(company.careersUrl, 'Careers page') + '</div>';
+    }
+    if (job.warmConnections.length > 0) {
+      html += '<div class="job-section">Your connections</div>' + job.warmConnections.map(function(name) {
+        return '<div class="job-line">' + escHtml(name) + '</div>';
+      }).join('');
+    }
+    if (posting) html += peopleHtml('Possible hiring managers', posting.hiringManagers);
+    if (company) {
+      html += peopleHtml('Recruiters', company.recruiters);
+      html += peopleHtml('Engineering leaders', company.engineeringLeaders);
+    }
+    if (r.outreachDraft) {
+      html += '<div class="job-section">Draft note</div><div class="job-draft">' + escHtml(r.outreachDraft) + '</div>'
+        + '<div class="job-actions"><button class="job-btn job-btn-small" data-action="copy">Copy note</button></div>';
+    }
+    (r.warnings || []).forEach(function(w) {
+      html += '<div class="job-warning">⚠ ' + escHtml(w) + '</div>';
+    });
+    return html + '</div>';
+  }
+
+  function renderJobCard(job, index) {
+    var delay = Math.min(index * 0.03, 0.4);
+    var expanded = jobView === 'yay' || expandedJobs.has(job.jobId);
+    var place = [job.location, job.workplace !== 'unknown' ? job.workplace : null].filter(Boolean).join(' · ');
+    var meta = '<span class="badge badge-' + job.verdict + '">' + job.verdict + '</span>';
+    if (job.decidedBy === 'rule') meta += '<span class="badge badge-plain">rule</span>';
+    if (job.warmConnections.length > 0) meta += '<span class="badge badge-warm">warm ' + job.warmConnections.length + '</span>';
+    if (job.sightingCount > 1) meta += '<span class="badge badge-plain">seen ' + job.sightingCount + '×</span>';
+    meta += '<span class="card-time">' + timeAgo(job.firstSeenAt) + '</span>';
+
+    var buttons = '';
+    if (jobView === 'yay') {
+      buttons = '<button class="job-btn job-btn-nay" data-action="nay">Pass</button>';
+    } else if (jobView === 'passed') {
+      buttons = '<button class="job-btn job-btn-yay" data-action="yay">Yay</button>';
+    } else {
+      buttons = '<button class="job-btn job-btn-nay" data-action="nay">Nay</button>'
+        + '<button class="job-btn job-btn-yay" data-action="yay">' + (jobView === 'nay' ? 'Un-nay' : 'Yay') + '</button>';
+    }
+
+    var more = '<div class="job-more">'
+      + (job.url ? '<div class="job-line">' + linkHtml(job.url, 'Open posting on ' + (job.source || 'the job board')) + '</div>' : '')
+      + (jobView !== 'yay' && job.warmConnections.length > 0 ? '<div class="job-line"><b>Warm:</b> ' + escHtml(job.warmConnections.join('; ')) + '</div>' : '')
+      + '<div class="job-line"><b>Screen:</b> model said ' + escHtml(job.modelVerdict) + ', fit ' + job.fitScore + ', profile v' + job.profileVersion + '</div>'
+      + (job.decisionNote ? '<div class="job-line"><b>Your note:</b> ' + escHtml(job.decisionNote) + '</div>' : '')
+      + (jobView === 'yay' || jobView === 'passed' ? '' : '<input class="note-input" style="margin-top:8px" data-role="note" maxlength="300" placeholder="Why? Optional, and it trains the screen">')
+      + '</div>';
+
+    return '<div class="job-card' + (expanded ? ' expanded' : '') + '" data-id="' + job.jobId + '" style="animation-delay:' + delay + 's">'
+      + '<div class="job-head" data-action="toggle">'
+      +   '<div class="job-title">' + escHtml(job.title) + '</div>'
+      +   '<div class="job-company">' + escHtml(job.company) + '</div>'
+      +   '<div class="job-facts">' + escHtml(place || 'location not listed') + ' · ' + escHtml(jobPay(job)) + '</div>'
+      +   '<div class="card-meta">' + meta + '</div>'
+      +   '<div class="job-reason">' + escHtml(job.reason) + '</div>'
+      + '</div>'
+      + more
+      + (jobView === 'yay' ? researchHtml(job) : '')
+      + '<div class="job-actions">' + buttons + '</div>'
+      + '</div>';
+  }
+
+  function renderJobs() {
+    jobHintEl.textContent = JOB_HINTS[jobView];
+    if (jobItems.length === 0) {
+      jobListEl.innerHTML = '';
+      jobEmptyEl.textContent = JOB_EMPTY[jobView];
+      jobEmptyEl.style.display = '';
+    } else {
+      jobEmptyEl.style.display = 'none';
+      jobListEl.innerHTML = jobItems.map(renderJobCard).join('');
+    }
+    scheduleJobPoll();
+  }
+
+  function scheduleJobPoll() {
+    clearTimeout(jobPollTimer);
+    var waiting = jobView === 'yay' && jobItems.some(function(job) {
+      return job.research && (job.research.status === 'pending' || job.research.status === 'running');
+    });
+    if (waiting && activeTab === 'jobs') {
+      jobPollTimer = setTimeout(function() { loadJobs(true); }, 10000);
+    }
+  }
+
+  async function loadJobCounts() {
+    try {
+      var res = await fetch('/api/jobs/counts');
+      if (!res.ok) return;
+      var counts = await res.json();
+      jobsBadgeEl.textContent = counts.review > 0 ? counts.review : '';
+      jobFiltersEl.querySelectorAll('[data-count]').forEach(function(el) {
+        var n = counts[el.getAttribute('data-count')];
+        el.textContent = n > 0 ? String(n) : '';
+      });
+    } catch (e) { /* silent */ }
+  }
+
+  async function loadJobs(quiet) {
+    if (jobsLoading) return;
+    jobsLoading = true;
+    if (!quiet) refreshBtn.classList.add('loading');
+    try {
+      var res = await fetch('/api/jobs?view=' + encodeURIComponent(jobView) + '&limit=100');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      jobItems = await res.json();
+      renderJobs();
+      loadJobCounts();
+    } catch (e) {
+      showToast('Failed to load jobs: ' + e.message, true);
+    } finally {
+      jobsLoading = false;
+      refreshBtn.classList.remove('loading');
+    }
+  }
+
+  async function submitJobDecision(card, job, decision) {
+    var noteEl = card.querySelector('[data-role="note"]');
+    var note = noteEl ? noteEl.value.trim() : '';
+    card.querySelectorAll('button').forEach(function(b) { b.disabled = true; });
+    try {
+      var res = await fetch('/api/jobs/decision', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jobId: job.jobId, decision: decision, note: note || undefined }),
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      card.classList.add('removing');
+      setTimeout(function() {
+        jobItems = jobItems.filter(function(item) { return item.jobId !== job.jobId; });
+        renderJobs();
+      }, 250);
+      loadJobCounts();
+      showToast(decision === 'yay' ? 'Yay: research started' : 'Passed', false);
+    } catch (e) {
+      card.querySelectorAll('button').forEach(function(b) { b.disabled = false; });
+      showToast('Could not save: ' + e.message, true);
+    }
+  }
+
+  jobFiltersEl.addEventListener('click', function(e) {
+    var btn = e.target.closest('.job-filter');
+    if (!btn) return;
+    jobView = btn.getAttribute('data-view');
+    jobFiltersEl.querySelectorAll('.job-filter').forEach(function(f) { f.classList.toggle('active', f === btn); });
+    jobItems = [];
+    jobListEl.innerHTML = '';
+    loadJobs(false);
+  });
+
+  jobListEl.addEventListener('click', async function(e) {
+    var actionEl = e.target.closest('[data-action]');
+    var card = e.target.closest('.job-card');
+    if (!actionEl || !card) return;
+    var jobId = parseInt(card.getAttribute('data-id'));
+    var job = jobItems.find(function(item) { return item.jobId === jobId; });
+    if (!job) return;
+    var action = actionEl.getAttribute('data-action');
+
+    if (action === 'toggle') {
+      if (jobView === 'yay') return;
+      if (expandedJobs.has(jobId)) expandedJobs.delete(jobId); else expandedJobs.add(jobId);
+      card.classList.toggle('expanded');
+    } else if (action === 'yay' || action === 'nay') {
+      submitJobDecision(card, job, action);
+    } else if (action === 'copy') {
+      try {
+        await navigator.clipboard.writeText(job.research.outreachDraft);
+        showToast('Note copied', false);
+      } catch (err) {
+        showToast('Copy failed', true);
+      }
+    } else if (action === 'retry') {
+      actionEl.disabled = true;
+      try {
+        var res = await fetch('/api/jobs/research/retry', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ jobId: jobId }),
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        loadJobs(true);
+      } catch (err) {
+        actionEl.disabled = false;
+        showToast('Retry failed: ' + err.message, true);
+      }
+    }
+  });
+
   attnLoadMoreBtn.addEventListener('click', function() { loadAttention(false); });
 
   // Initial load
   loadAttention(true);
   loadAttentionCount();
   loadUnsubscribeCount();
+  loadJobCounts();
 })();
 </script>
 
@@ -2021,6 +2551,9 @@ async function start() {
   await ensureOptimizationTables();
   await ensureAttentionActionsTable();
   await ensureUnsubscribeActionsTable();
+  await ensureJobTables();
+  // Resume research that a restart interrupted.
+  kickResearch();
 
   serve({ fetch: app.fetch, port: 3100 }, (info) => {
     console.log(`Email Triage server running on http://localhost:${info.port}`);

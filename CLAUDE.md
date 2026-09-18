@@ -39,7 +39,13 @@ src/
   accuracy.ts   — Accuracy stats CLI
   cleanup.ts    — Standalone inbox cleanup (archive read mail older than 1 month)
   unsubscribe.ts — RFC 8058 parsing, public-network validation, and pinned-address HTTPS POSTs
-  *.test.ts     — Vitest unit tests for jmap, db, classifier
+  openrouter.ts — Shared structured-output OpenRouter call (optional web plugin + citations)
+  jobs.ts       — Job-alert parsing, profile rules, prompts, output checks (pure, tested)
+  jobsDb.ts     — Job tables and queries (uses db.ts getPool())
+  jobScoring.ts — Job-alert pipeline, run after triage and by `npm run jobs -- process`
+  jobResearch.ts — Research and outreach drafts for confirmed yays
+  jobsCli.ts    — `npm run jobs` commands and the hidden-nay TUI
+  *.test.ts     — Vitest unit tests
 db/schema.sql   — Full schema, idempotent
 launchd/        — launchd plists for scheduled services
 docs/plans/     — Design + implementation notes for shipped features
@@ -91,6 +97,9 @@ npm run accuracy                  # correction-rate stats
 npm run server                    # web UI + JSON API on port 3100
 npm run restart                   # reload the launchd server job (macOS)
 
+npm run jobs -- help              # job-alert pipeline: profile, process, nays, research, stats
+npm run jobs -- process --dry-run # screen recent job alerts, save nothing
+
 npm run cleanup                   # archive read inbox mail older than 1 month
 npm run cleanup -- --dry-run
 
@@ -109,13 +118,14 @@ machine.
 
 - `FASTMAIL_API_TOKEN` — Fastmail API token with mail read/write access
 - `OPENROUTER_API_KEY` — OpenRouter key for primary and backup models
-- `OPENROUTER_DAILY_BUDGET_USD` — optional daily cost ceiling; defaults to $1.00
+- `OPENROUTER_DAILY_BUDGET_USD` — optional daily triage cost ceiling; defaults to $1.00
+- `JOB_DAILY_BUDGET_USD` — optional daily job-pipeline cost ceiling; defaults to $2.00
 - `DATABASE_URL` — Postgres connection string
 - `UPTIME_KUMA_PUSH_URL` — optional heartbeat pinged after a successful triage run
 
 ## Database schema
 
-Postgres, a `tier` ENUM, and seven tables. The authoritative DDL is
+Postgres, a `tier` ENUM, and sixteen tables (seven for triage, nine for job alerts). The authoritative DDL is
 [`db/schema.sql`](db/schema.sql) — **update that file when you change the schema.**
 
 | Table | Purpose |
@@ -127,9 +137,10 @@ Postgres, a `tier` ENUM, and seven tables. The authoritative DDL is
 | `sender_rules` | Exact normalized sender rules learned from corrections |
 | `model_calls` | Token, cache, cost, latency, and failure data for each model attempt |
 | `unsubscribe_actions` | Approved one-click/keep decisions and outcome audit data, without full URLs |
+| `job_*`, `jobs`, `company_research`, `linkedin_connections`, `active_pipeline` | Job-alert pipeline; see README |
 
-`corrections`, `attention_actions`, `sender_rules`, `model_calls`, and `unsubscribe_actions`
-are auto-created at runtime.
+`corrections`, `attention_actions`, `sender_rules`, `model_calls`, `unsubscribe_actions`,
+and all job tables are auto-created at runtime.
 `triage_runs` and
 `classifications` are not — a fresh database needs `db/schema.sql` first.
 
@@ -171,12 +182,13 @@ The attention queue query takes the latest classification per `email_id`
 
 ## Testing
 
-Vitest tests across `jmap.test.ts`, `db.test.ts`, `routing.test.ts`, and `classifier.test.ts`. They
+Vitest tests across `jmap`, `db`, `routing`, `classifier`, `server`, `unsubscribe`, and the
+`jobs*` modules. They
 mock `fetch` and the pg pool — **no network, no database, no API keys required**, so
 `npm test` is safe to run anywhere and should be run before every commit.
 
-Not covered: `server.ts`, `act.ts`, `correct.ts`, `cleanup.ts`, and the end-to-end loop in
-`index.ts`. Changes there need manual verification — `npm run triage -- --dry-run` for
+Not covered: the `server.ts` UI (a test only checks that its script parses), `jobsCli.ts`,
+`act.ts`, `correct.ts`, `cleanup.ts`, and the end-to-end loop in `index.ts`. Changes there need manual verification — `npm run triage -- --dry-run` for
 triage, and the running server for UI work.
 
 ## Key technical details
@@ -190,8 +202,8 @@ triage, and the running server for UI work.
   auto-archives without a model call
 - **Failure behavior**: both model failures abort the run without writing classifications;
   mail remains unread and the failed heartbeat is sent
-- **Web UI**: Hono on port 3100, dark mobile UI, Attention tab default, Review and
-  Unsubscribe lazy-loaded. The unsubscribe tab requires a second confirmation click and
+- **Web UI**: Hono on port 3100, dark mobile UI, Attention tab default, Review, Jobs, and
+  Unsub lazy-loaded. The unsubscribe tab requires a second confirmation click and
   processes at most 25 exact senders per batch.
   **No authentication** — it is meant to sit behind Cloudflare Access, not be exposed
 - **Unsubscribe safety**: candidate URLs are re-fetched from JMAP at approval time and never
@@ -203,6 +215,22 @@ triage, and the running server for UI work.
 - **Scheduled services**: launchd plists for server, hourly triage, and Cloudflare Tunnel.
   They hardcode absolute paths for one machine — see the README before loading them
   elsewhere. The absolute node path exists because launchd doesn't load asdf shims
+
+## Job alerts
+
+- **The job profile is private.** It holds a pay floor and employer opinions. It lives in
+  `job_profiles`, loaded with `npm run jobs -- profile set <file>`. Never commit it or copy
+  it into prompts, tests, fixtures, or docs. `private/` is gitignored for local copies.
+- **Posting and web text are untrusted.** Postings have carried hidden instructions for AI
+  tools. Keep the drafting call isolated from raw posting and web text, and keep the
+  `injectionWarnings` and `lintOutreach` checks on anything drafted.
+- **Never store model-written URLs.** Job URLs come only from `[J#]` references that
+  `canonicalJobUrl` produced. Research contacts are kept only when their source URL is in
+  the web plugin's citations.
+- **Hard rules only push toward nay.** A warm path is the only thing that lifts a verdict,
+  and only from maybe to yay. Missing salary never triggers a nay.
+- Job spend is `model_calls.purpose = 'jobs'`, with its own budget, so it cannot starve triage.
+- The job pipeline never fails a triage run; it logs and moves on.
 
 ## Gotchas
 

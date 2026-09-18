@@ -12,6 +12,7 @@
     "server": "doppler run -- tsx src/server.ts",
     "restart": "./bin/restart-server",
     "act": "doppler run -- tsx src/act.ts",
+    "jobs": "doppler run -- tsx src/jobsCli.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage"

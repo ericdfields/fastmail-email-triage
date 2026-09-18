@@ -33,6 +33,7 @@ const TIER_CODES: Record<string, Tier> = {
 const MODEL_RATES: Record<string, { input: number; output: number; cachedInput: number }> = {
   [PRIMARY_MODEL]: { input: 0.1, output: 0.6, cachedInput: 0.01 },
   [BACKUP_MODEL]: { input: 1, output: 5, cachedInput: 0.1 },
+  "anthropic/claude-sonnet-5": { input: 2, output: 10, cachedInput: 0.2 },
 };
 
 export interface ModelUsage {
@@ -58,7 +59,7 @@ export interface ClassificationHooks {
   onAttempt?: (attempt: ModelAttempt) => Promise<void>;
 }
 
-type OpenRouterUsage = {
+export type OpenRouterUsage = {
   prompt_tokens?: number;
   completion_tokens?: number;
   cache_read_input_tokens?: number;
@@ -67,7 +68,7 @@ type OpenRouterUsage = {
   prompt_tokens_details?: { cached_tokens?: number };
 };
 
-function emptyUsage(): ModelUsage {
+export function emptyUsage(): ModelUsage {
   return {
     inputTokens: 0,
     outputTokens: 0,
@@ -77,7 +78,7 @@ function emptyUsage(): ModelUsage {
   };
 }
 
-function parseUsage(model: string, raw: OpenRouterUsage | undefined): ModelUsage {
+export function parseUsage(model: string, raw: OpenRouterUsage | undefined): ModelUsage {
   const inputTokens = raw?.prompt_tokens ?? 0;
   const outputTokens = raw?.completion_tokens ?? 0;
   const cacheReadTokens = raw?.prompt_tokens_details?.cached_tokens ?? raw?.cache_read_input_tokens ?? 0;
@@ -97,7 +98,7 @@ function parseUsage(model: string, raw: OpenRouterUsage | undefined): ModelUsage
   return { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, costUsd: estimatedCost };
 }
 
-function errorType(error: unknown): string {
+export function errorType(error: unknown): string {
   if (error instanceof Error) return error.name || "Error";
   return "UnknownError";
 }

@@ -16,13 +16,30 @@ import {
   recordModelCall,
 } from "./db.js";
 import { routeDeterministically, senderKey } from "./routing.js";
-import type { Classification, MailboxIds, Tier } from "./types.js";
+import { ensureJobTables } from "./jobsDb.js";
+import { processJobAlerts } from "./jobScoring.js";
+import { runPendingResearch } from "./jobResearch.js";
+import type { Classification, JMAPSession, MailboxIds, Tier } from "./types.js";
 
 const DEFAULT_DAILY_BUDGET_USD = 1;
 
 function dailyBudgetUsd(): number {
   const configured = Number(process.env.OPENROUTER_DAILY_BUDGET_USD ?? DEFAULT_DAILY_BUDGET_USD);
   return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_DAILY_BUDGET_USD;
+}
+
+const JOB_INTERVAL_MS = 15 * 60_000;
+
+/** Job alerts are a side pipeline: a failure there is logged and never fails triage. */
+async function runJobPipeline(session: JMAPSession): Promise<void> {
+  try {
+    console.log("\n--- Job alerts ---");
+    await ensureJobTables();
+    await processJobAlerts({ session, days: 3, limit: 100, dryRun: false });
+    await runPendingResearch(3);
+  } catch (err) {
+    console.error("Job pipeline failed (triage unaffected):", err);
+  }
 }
 
 async function pingHeartbeat(status: "up" | "down", message: string): Promise<void> {
@@ -104,6 +121,7 @@ async function main() {
 
   let batchNum = 0;
   let stopping = false;
+  let lastJobRun = 0;
 
   if (watchMode) {
     process.on("SIGINT", () => {
@@ -221,6 +239,12 @@ async function main() {
 
       // Rate limiting pause
       await new Promise((r) => setTimeout(r, 500));
+    }
+
+    // Dry runs skip jobs; use `npm run jobs -- process --dry-run` instead.
+    if (!dryRun && !stopping && Date.now() - lastJobRun >= JOB_INTERVAL_MS) {
+      lastJobRun = Date.now();
+      await runJobPipeline(session);
     }
 
     if (!watchMode || stopping) break;

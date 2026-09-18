@@ -10,3 +10,6 @@ output/
 
 .DS_Store
 *.log
+
+# Private local inputs (job profile, LinkedIn connection exports). This repo is public.
+private/
