@@ -9,6 +9,11 @@ const mocks = vi.hoisted(() => ({
   getMailboxIds: vi.fn(),
   fetchUnsubscribeHeaders: vi.fn(),
   unsubscribeOneClick: vi.fn(),
+  getJobs: vi.fn(),
+  getJobCounts: vi.fn(),
+  recordJobDecision: vi.fn(),
+  retryJobResearch: vi.fn(),
+  runPendingResearch: vi.fn(),
 }));
 
 vi.mock("./db.js", () => ({
@@ -43,6 +48,19 @@ vi.mock("./unsubscribe.js", async (importOriginal) => {
   return { ...original, unsubscribeOneClick: mocks.unsubscribeOneClick };
 });
 
+vi.mock("./jobsDb.js", () => ({
+  ensureJobTables: vi.fn(),
+  getJobs: mocks.getJobs,
+  getJobCounts: mocks.getJobCounts,
+  recordJobDecision: mocks.recordJobDecision,
+  retryJobResearch: mocks.retryJobResearch,
+  JOB_VIEWS: ["review", "yay", "nay", "in-process", "passed"],
+}));
+
+vi.mock("./jobResearch.js", () => ({
+  runPendingResearch: mocks.runPendingResearch,
+}));
+
 import { app } from "./server.js";
 
 const candidate = {
@@ -74,6 +92,9 @@ beforeEach(() => {
   );
   mocks.startUnsubscribeAction.mockResolvedValue(11);
   mocks.unsubscribeOneClick.mockResolvedValue({ httpStatus: 204, targetHost: "news.example.com" });
+  mocks.getJobs.mockResolvedValue([]);
+  mocks.recordJobDecision.mockResolvedValue(true);
+  mocks.runPendingResearch.mockResolvedValue(0);
 });
 
 describe("unsubscribe API", () => {
@@ -170,5 +191,64 @@ describe("unsubscribe API", () => {
 
     expect(response.status).toBe(200);
     expect(mocks.keepUnsubscribeSender).toHaveBeenCalledWith("news@example.com", "email-9");
+  });
+});
+
+function postJson(path: string, body: unknown) {
+  return app.request(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+describe("jobs API", () => {
+  it("lists a known view and rejects unknown views", async () => {
+    const ok = await app.request("/api/jobs?view=nay&limit=500&offset=-4");
+    const bad = await app.request("/api/jobs?view=everything");
+
+    expect(ok.status).toBe(200);
+    expect(mocks.getJobs).toHaveBeenCalledWith("nay", 100, 0);
+    expect(bad.status).toBe(400);
+  });
+
+  it("records a yay and starts research", async () => {
+    const response = await postJson("/api/jobs/decision", { jobId: 5, decision: "yay", note: "  warm intro  " });
+
+    expect(response.status).toBe(200);
+    expect(mocks.recordJobDecision).toHaveBeenCalledWith(5, "yay", "warm intro");
+    await vi.waitFor(() => expect(mocks.runPendingResearch).toHaveBeenCalled());
+  });
+
+  it("records a nay without starting research", async () => {
+    const response = await postJson("/api/jobs/decision", { jobId: 5, decision: "nay" });
+
+    expect(response.status).toBe(200);
+    expect(mocks.recordJobDecision).toHaveBeenCalledWith(5, "nay", undefined);
+    expect(mocks.runPendingResearch).not.toHaveBeenCalled();
+  });
+
+  it("validates decisions", async () => {
+    expect((await postJson("/api/jobs/decision", { jobId: "5", decision: "yay" })).status).toBe(400);
+    expect((await postJson("/api/jobs/decision", { jobId: 5, decision: "maybe" })).status).toBe(400);
+    mocks.recordJobDecision.mockResolvedValue(false);
+    expect((await postJson("/api/jobs/decision", { jobId: 99, decision: "nay" })).status).toBe(404);
+  });
+
+  it("retries research only when there is something to retry", async () => {
+    mocks.retryJobResearch.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+    expect((await postJson("/api/jobs/research/retry", { jobId: 5 })).status).toBe(200);
+    expect((await postJson("/api/jobs/research/retry", { jobId: 5 })).status).toBe(409);
+  });
+});
+
+describe("web UI", () => {
+  it("serves a page whose inline script parses", async () => {
+    const html = await (await app.request("/")).text();
+    const script = html.match(/<script>([\s\S]*)<\/script>/)?.[1];
+
+    expect(script).toBeTruthy();
+    expect(() => new Function(script!)).not.toThrow();
+    expect(html).toContain('data-tab="jobs"');
   });
 });

@@ -430,3 +430,104 @@ export async function applyTierAction(
     ],
   });
 }
+
+/**
+ * Find job-alert emails from exact senders in any mailbox. Triage archives these, so the
+ * job pipeline searches everywhere rather than just the inbox.
+ */
+export async function queryEmailsFromSenders(
+  session: JMAPSession,
+  senders: string[],
+  sinceIso: string,
+  limit: number
+): Promise<EmailSummary[]> {
+  if (senders.length === 0) return [];
+
+  const data = await jmapRequest(session, {
+    using: ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+    methodCalls: [
+      [
+        "Email/query",
+        {
+          accountId: session.accountId,
+          filter: {
+            operator: "AND",
+            conditions: [
+              { after: sinceIso },
+              { operator: "OR", conditions: senders.map((from) => ({ from })) },
+            ],
+          },
+          sort: [{ property: "receivedAt", isAscending: false }],
+          limit,
+        },
+        "senders0",
+      ],
+      [
+        "Email/get",
+        {
+          accountId: session.accountId,
+          properties: ["id", "threadId", "subject", "from", "receivedAt", "preview"],
+          "#ids": { resultOf: "senders0", name: "Email/query", path: "/ids" },
+        },
+        "senders1",
+      ],
+    ],
+  });
+
+  const wanted = new Set(senders.map((sender) => sender.toLowerCase()));
+  const emails: any[] = data.methodResponses[1][1].list ?? [];
+  return emails
+    .map((email) => ({
+      id: email.id,
+      threadId: email.threadId,
+      subject: email.subject || "(no subject)",
+      from: email.from || [],
+      receivedAt: email.receivedAt || new Date().toISOString(),
+      preview: email.preview || "",
+      hasListUnsubscribe: false,
+      listUnsubscribeUrls: null,
+    }))
+    // JMAP `from` is a substring match; keep exact addresses only.
+    .filter((email: EmailSummary) => email.from.some((from) => wanted.has(from.email.toLowerCase())));
+}
+
+/** Fetch full text and HTML bodies, for parsing multi-job alert emails. */
+export async function fetchEmailContent(
+  session: JMAPSession,
+  emailIds: string[]
+): Promise<Map<string, { text: string | null; html: string | null }>> {
+  if (emailIds.length === 0) return new Map();
+
+  const data = await jmapRequest(session, {
+    using: ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+    methodCalls: [
+      [
+        "Email/get",
+        {
+          accountId: session.accountId,
+          ids: emailIds,
+          properties: ["id", "textBody", "htmlBody", "bodyValues"],
+          fetchTextBodyValues: true,
+          fetchHTMLBodyValues: true,
+          maxBodyValueBytes: 400_000,
+        },
+        "content0",
+      ],
+    ],
+  });
+
+  const result = new Map<string, { text: string | null; html: string | null }>();
+  const emails: any[] = data.methodResponses[0][1].list ?? [];
+  for (const email of emails) {
+    const bodyValues: Record<string, { value: string }> = email.bodyValues ?? {};
+    const part = (parts: any[] | undefined, type: string): string | null => {
+      const match = (parts ?? []).find((p) => p.type === type);
+      return match ? bodyValues[match.partId]?.value ?? null : null;
+    };
+    result.set(email.id, {
+      text: part(email.textBody, "text/plain"),
+      html: part(email.htmlBody, "text/html"),
+    });
+  }
+  return result;
+}

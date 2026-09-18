@@ -12,6 +12,11 @@ export function initDb() {
   pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false }, max: 3 });
 }
 
+/** Shared pool for sibling data modules such as jobsDb.ts. */
+export function getPool(): pg.Pool {
+  return pool;
+}
+
 export async function closeDb() {
   await pool.end();
 }
@@ -205,6 +210,23 @@ export async function ensureOptimizationTables() {
   await pool.query(`
     CREATE INDEX IF NOT EXISTS model_calls_created_at_idx
     ON model_calls (created_at DESC)
+  `);
+
+  // Job-alert calls happen outside triage runs and have their own budget. The guard
+  // skips the ALTER (and its table lock) on every run after the first.
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'model_calls' AND column_name = 'purpose'
+      ) THEN
+        ALTER TABLE model_calls
+          ADD COLUMN purpose TEXT NOT NULL DEFAULT 'triage',
+          ALTER COLUMN run_id DROP NOT NULL;
+      END IF;
+    END
+    $$
   `);
 
   await pool.query(`
@@ -401,12 +423,16 @@ export async function getSenderRules(senders: string[]): Promise<Map<string, Tie
 }
 
 /** Persist one OpenRouter attempt for cost, reliability, and latency monitoring. */
-export async function recordModelCall(runId: number, call: ModelAttempt): Promise<void> {
+export async function recordModelCall(
+  runId: number | null,
+  call: ModelAttempt,
+  purpose: ModelPurpose = "triage"
+): Promise<void> {
   await pool.query(
     `INSERT INTO model_calls
        (run_id, model, attempt, status, batch_size, input_tokens, output_tokens,
-        cache_read_tokens, cache_write_tokens, cost_usd, latency_ms, error_type)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+        cache_read_tokens, cache_write_tokens, cost_usd, latency_ms, error_type, purpose)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
     [
       runId,
       call.model,
@@ -420,15 +446,20 @@ export async function recordModelCall(runId: number, call: ModelAttempt): Promis
       call.usage.costUsd,
       call.latencyMs,
       call.errorType ?? null,
+      purpose,
     ]
   );
 }
 
-export async function getTodayModelSpend(): Promise<number> {
+export type ModelPurpose = "triage" | "jobs";
+
+export async function getTodayModelSpend(purpose: ModelPurpose = "triage"): Promise<number> {
   const result = await pool.query<{ cost: string }>(
     `SELECT COALESCE(SUM(cost_usd), 0)::text AS cost
      FROM model_calls
-     WHERE created_at >= date_trunc('day', now())`
+     WHERE created_at >= date_trunc('day', now())
+       AND purpose = $1`,
+    [purpose]
   );
   return Number(result.rows[0]?.cost ?? 0);
 }

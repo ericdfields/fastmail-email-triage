@@ -333,12 +333,20 @@ describe("model call accounting", () => {
 
     const [sql, params] = mockQuery.mock.calls[0] as [string, unknown[]];
     expect(sql).toContain("INSERT INTO model_calls");
-    expect(params).toEqual([42, "model-a", 1, "success", 10, 100, 20, 50, 0, 0.0002, 250, null]);
+    expect(params).toEqual([42, "model-a", 1, "success", 10, 100, 20, 50, 0, 0.0002, 250, null, "triage"]);
   });
 
   it("returns today's accumulated model spend", async () => {
     mockQuery.mockResolvedValue({ rows: [{ cost: "0.4321" }] });
     await expect(getTodayModelSpend()).resolves.toBe(0.4321);
+    expect(mockQuery.mock.calls[0]![1]).toEqual(["triage"]);
+  });
+
+  it("keeps job spend separate from triage spend", async () => {
+    mockQuery.mockResolvedValue({ rows: [{ cost: "0.1" }] });
+    await getTodayModelSpend("jobs");
+    expect(mockQuery.mock.calls[0]![0]).toContain("purpose = $1");
+    expect(mockQuery.mock.calls[0]![1]).toEqual(["jobs"]);
   });
 });
 
