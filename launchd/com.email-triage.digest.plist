@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.email-triage.digest</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/doppler</string>
+        <string>run</string>
+        <string>--</string>
+        <string>/Users/ericbrookfield/.local/share/mise/shims/node</string>
+        <string>node_modules/.bin/tsx</string>
+        <string>src/jobsCli.ts</string>
+        <string>digest</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/ericbrookfield/Development/fastmail-email-triage</string>
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Hour</key>
+            <integer>7</integer>
+            <key>Minute</key>
+            <integer>30</integer>
+            <key>Weekday</key>
+            <integer>1</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>7</integer>
+            <key>Minute</key>
+            <integer>30</integer>
+            <key>Weekday</key>
+            <integer>2</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>7</integer>
+            <key>Minute</key>
+            <integer>30</integer>
+            <key>Weekday</key>
+            <integer>3</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>7</integer>
+            <key>Minute</key>
+            <integer>30</integer>
+            <key>Weekday</key>
+            <integer>4</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>7</integer>
+            <key>Minute</key>
+            <integer>30</integer>
+            <key>Weekday</key>
+            <integer>5</integer>
+        </dict>
+    </array>
+    <key>StandardOutPath</key>
+    <string>/Users/ericbrookfield/Library/Logs/email-triage-digest.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/ericbrookfield/Library/Logs/email-triage-digest.log</string>
+</dict>
+</plist>

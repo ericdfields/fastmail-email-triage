@@ -13,3 +13,6 @@ output/
 
 # Private local inputs (job profile, LinkedIn connection exports). This repo is public.
 private/
+
+# Generated at runtime (morning digest snapshots).
+data/

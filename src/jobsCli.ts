@@ -16,6 +16,7 @@ import {
 } from "./jobsDb.js";
 import type { JobRow } from "./jobsDb.js";
 import { processJobAlerts } from "./jobScoring.js";
+import { buildDigest, defaultDigestDir, writeDigestFiles } from "./jobsDigest.js";
 
 const USAGE = `Usage: npm run jobs -- <command>
 
@@ -30,7 +31,8 @@ const USAGE = `Usage: npm run jobs -- <command>
   pipeline add <company> [--stage TEXT]
   pipeline remove <company>
   pipeline list
-  stats                          Screen verdicts against your decisions, per profile version`;
+  stats                          Screen verdicts against your decisions, per profile version
+  digest [--hours N] [--out DIR]  Write the morning prospects digest (default: 24h, data/digest)`;
 
 const ESC = {
   clear: "\x1b[2J\x1b[H",
@@ -255,6 +257,13 @@ async function main() {
     case "stats":
       await statsCommand();
       break;
+    case "digest": {
+      const digest = await buildDigest(flag(args, "--hours", 24));
+      const outDir = textFlag(args, "--out") ?? defaultDigestDir();
+      const { jsonPath, htmlPath } = await writeDigestFiles(digest, outDir);
+      console.log(`Digest: ${digest.count} new prospect(s), wrote ${jsonPath} and ${htmlPath}`);
+      break;
+    }
     default:
       throw new Error(USAGE);
   }

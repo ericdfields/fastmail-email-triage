@@ -40,6 +40,7 @@ import {
   retryJobResearch,
 } from "./jobsDb.js";
 import type { JobView } from "./jobsDb.js";
+import { buildDigest, defaultDigestDir, readLatestDigest, renderDigestHtml } from "./jobsDigest.js";
 import { runPendingResearch } from "./jobResearch.js";
 import type { Tier, JMAPSession, MailboxIds } from "./types.js";
 
@@ -419,6 +420,19 @@ app.post("/api/jobs/research/retry", async (c) => {
   if (!(await retryJobResearch(jobId))) return c.json({ error: "Nothing to retry" }, 409);
   kickResearch();
   return c.json({ success: true });
+});
+
+// API: Morning prospects digest. Serves the launchd-generated snapshot when
+// present, otherwise builds one live from the review queue.
+app.get("/api/jobs/digest", async (c) => {
+  const cached = await readLatestDigest(defaultDigestDir());
+  return c.json(cached ?? (await buildDigest(24)));
+});
+
+// Human-readable morning digest page.
+app.get("/digest", async (c) => {
+  const cached = await readLatestDigest(defaultDigestDir());
+  return c.html(renderDigestHtml(cached ?? (await buildDigest(24))));
 });
 
 // Frontend: Inline single-page app for mobile classification review
