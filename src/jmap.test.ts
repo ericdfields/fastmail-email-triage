@@ -378,6 +378,50 @@ describe("fetchAllUnread", () => {
     expect(batches[0]![1]!.listUnsubscribeUrls).toEqual(["https://unsub.example.com"]);
   });
 
+  it("detects calendar invites anywhere in the body structure", async () => {
+    const structures = [
+      {
+        type: "multipart/mixed",
+        subParts: [
+          { type: "multipart/alternative", subParts: [{ type: "text/plain" }, { type: "text/calendar" }] },
+        ],
+      },
+      {
+        type: "multipart/mixed",
+        subParts: [{ type: "text/plain" }, { type: "application/octet-stream", name: "Invite.ICS" }],
+      },
+      { type: "multipart/alternative", subParts: [{ type: "text/html" }] },
+    ];
+    mockFetch.mockResolvedValue(
+      makeJmapResponse([
+        ["Email/query", { total: 3, ids: ["e0", "e1", "e2"] }, "query0"],
+        [
+          "Email/get",
+          {
+            list: structures.map((bodyStructure, i) => ({
+              id: `e${i}`,
+              threadId: `thread-e${i}`,
+              subject: "Invite",
+              from: [{ name: "Sender", email: "sender@example.com" }],
+              receivedAt: "2024-01-01T00:00:00Z",
+              preview: "",
+              "header:List-Unsubscribe:asURLs": null,
+              bodyStructure,
+            })),
+          },
+          "get0",
+        ],
+      ])
+    );
+
+    const batches: EmailSummary[][] = [];
+    for await (const batch of fetchAllUnread(session, "inbox-1")) {
+      batches.push(batch);
+    }
+
+    expect(batches[0]!.map((email) => email.hasCalendarInvite)).toEqual([true, true, false]);
+  });
+
   it("yields multiple batches for large mailboxes", async () => {
     // Simulate 51 total emails: first batch returns 50, second returns 1
     const firstBatch = Array.from({ length: 50 }, (_, i) => ({ id: `e${i}`, hasUnsub: false }));

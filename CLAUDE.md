@@ -60,7 +60,8 @@ literal inside it. There is no frontend build step. Expect to scroll.
 1. Connect to Fastmail JMAP, resolve inbox / archive / trash mailbox IDs
 2. Check for an incomplete run to resume; retry pending actions first
 3. Fetch unread emails in batches of 50 via async generator
-4. Skip IDs classified in any prior run; route exact senders and List-Unsubscribe locally
+4. Skip IDs classified in any prior run; route calendar invites, exact senders, and
+   List-Unsubscribe locally
 5. Classify the remainder with GPT-5.6 Luna; retry once with Claude Haiku 4.5
 6. Persist classifications and per-attempt token/cost/latency accounting
 7. Apply tier actions via a single JMAP `Email/set` per batch
@@ -198,8 +199,9 @@ triage, and the running server for UI work.
 - **Max tokens**: dynamic by model batch size, capped at 2500
 - **Correction feedback**: corrections recorded via `act`, `correct`, or the web UI upsert
   an exact normalized sender rule. Future mail from that sender bypasses the model
-- **Deterministic routing**: explicit sender rules win; otherwise List-Unsubscribe mail
-  auto-archives without a model call
+- **Deterministic routing**: a calendar invite (`text/calendar` part or `.ics` file) always
+  goes to `attention`, even over a sender rule. Next, explicit sender rules win; otherwise
+  List-Unsubscribe mail auto-archives without a model call
 - **Failure behavior**: both model failures abort the run without writing classifications;
   mail remains unread and the failed heartbeat is sent
 - **Web UI**: Hono on port 3100, dark mobile UI, Attention tab default, Review, Jobs, and

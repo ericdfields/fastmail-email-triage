@@ -28,6 +28,12 @@ export function routeDeterministically(
   const modelEmails: EmailSummary[] = [];
 
   for (const email of emails) {
+    // Guards run first and only raise a tier. A missed invite costs more than a stray one.
+    if (email.hasCalendarInvite) {
+      deterministic.push(localClassification(email, "attention", "Calendar invite"));
+      continue;
+    }
+
     const ruleTier = senderRules.get(senderKey(email));
     if (ruleTier) {
       deterministic.push(localClassification(email, ruleTier, "Exact sender rule"));
