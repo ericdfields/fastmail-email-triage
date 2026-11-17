@@ -7,6 +7,7 @@ export interface EmailSummary {
   preview: string; // ~256 char snippet from JMAP
   hasListUnsubscribe: boolean;
   listUnsubscribeUrls: string[] | null;
+  hasCalendarInvite?: boolean; // a text/calendar or .ics part anywhere in the message
 }
 
 export type Tier = "auto-delete" | "auto-archive" | "confirm" | "attention";

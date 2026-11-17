@@ -103,6 +103,20 @@ export async function getMailboxIds(session: JMAPSession): Promise<MailboxIds> {
   };
 }
 
+interface BodyPart {
+  type?: string | null;
+  name?: string | null;
+  subParts?: BodyPart[] | null;
+}
+
+/** True when any MIME part is a calendar invite (text/calendar or an .ics file). */
+export function hasCalendarPart(part: BodyPart | null | undefined): boolean {
+  if (!part) return false;
+  if (part.type?.toLowerCase() === "text/calendar") return true;
+  if (part.name?.toLowerCase().endsWith(".ics")) return true;
+  return (part.subParts ?? []).some(hasCalendarPart);
+}
+
 function buildBatchRequest(
   accountId: string,
   inboxId: string,
@@ -138,7 +152,9 @@ function buildBatchRequest(
             "receivedAt",
             "preview",
             "header:List-Unsubscribe:asURLs",
+            "bodyStructure",
           ],
+          bodyProperties: ["type", "name", "subParts"],
           "#ids": {
             resultOf: "query0",
             name: "Email/query",
@@ -180,6 +196,7 @@ export async function* fetchAllUnread(
       hasListUnsubscribe:
         email["header:List-Unsubscribe:asURLs"] !== null,
       listUnsubscribeUrls: email["header:List-Unsubscribe:asURLs"],
+      hasCalendarInvite: hasCalendarPart(email.bodyStructure),
     }));
 
     yield emails;

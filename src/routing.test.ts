@@ -48,6 +48,19 @@ describe("deterministic routing", () => {
     });
   });
 
+  it("routes a calendar invite to attention before rules and List-Unsubscribe", () => {
+    const routed = routeDeterministically(
+      [makeEmail({ hasCalendarInvite: true, hasListUnsubscribe: true })],
+      new Map([["sender@example.com", "auto-delete"]])
+    );
+
+    expect(routed.modelEmails).toEqual([]);
+    expect(routed.deterministic[0]).toMatchObject({
+      tier: "attention",
+      reason: "Calendar invite",
+    });
+  });
+
   it("sends unmatched mail to the model", () => {
     const email = makeEmail();
     const routed = routeDeterministically([email], new Map());
